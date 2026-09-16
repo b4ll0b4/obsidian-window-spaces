@@ -7,7 +7,7 @@
 
 [![Obsidian Downloads](https://img.shields.io/badge/dynamic/json?logo=obsidian&color=7C3AED&label=Downloads&query=%24%5B%27window-spaces%27%5D.downloads&url=https%3A%2F%2Fraw.githubusercontent.com%2Fobsidianmd%2Fobsidian-releases%2Fmaster%2Fcommunity-plugin-stats.json)](https://obsidian.md/plugins?id=window-spaces)
 [![GitHub Release](https://img.shields.io/github/v/release/edwardsayer/obsidian-window-spaces?color=blue&logo=github)](https://github.com/edwardsayer/obsidian-window-spaces/releases)
-[![Obsidian Compatibility](https://img.shields.io/badge/Obsidian-v1.12.7%2B-purple.svg?logo=obsidian)](https://obsidian.md)
+[![Obsidian Compatibility](https://img.shields.io/badge/Obsidian-v1.13.0%2B-purple.svg?logo=obsidian)](https://obsidian.md)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
 [ English ](README.md) | [ 繁體中文 ](README.zh-TW.md) | [ 简体中文 ](README.zh-CN.md)
@@ -188,6 +188,6 @@ Window Spaces 与社区中许多强大且占空间的插件（如 **Excalidraw**
 
 ## 💻 系统兼容性
 
-- **Obsidian 版本需求**：`v1.12.7` 或以上
+- **Obsidian 版本需求**：`v1.13.0` 或以上
 - **支持平台**：桌面端（Windows, macOS, Linux）
 - **开源协议**：MIT License

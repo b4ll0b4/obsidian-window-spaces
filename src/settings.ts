@@ -342,10 +342,6 @@ export class WindowSpacesSettingTab extends PluginSettingTab {
     return setting;
   }
 
-  /** Declarative setting definitions are the only supported renderer (minAppVersion 1.13+). */
-  display(): void {
-    this.update();
-  }
   private getDefaultBorderInset(): number {
     const value = this.plugin.settings.defaultBorderInset;
     return typeof value === "number" && Number.isFinite(value) ? Math.max(0, Math.min(5, value)) : 1;

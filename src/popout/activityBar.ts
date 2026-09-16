@@ -59,6 +59,12 @@ interface DetachableLeafPrototype {
   detach?: (this: WorkspaceLeaf, ...args: unknown[]) => unknown;
 }
 
+function isDetachableLeafPrototype(value: unknown): value is DetachableLeafPrototype {
+  if (value === null || (typeof value !== "object" && typeof value !== "function")) return false;
+  const detach = (value as { detach?: unknown }).detach;
+  return typeof detach === "function";
+}
+
 /**
  * Popout Activity Bar 控制器。
  *
@@ -1554,11 +1560,13 @@ export class PopoutActivityBarManager {
       });
     }
 
-    const proto: DetachableLeafPrototype | null =
-      (WorkspaceLeaf as unknown as { prototype?: DetachableLeafPrototype })?.prototype ??
-      (leaf ? (Object.getPrototypeOf(leaf) as DetachableLeafPrototype) : null);
-
-    if (!proto || typeof proto.detach !== "function") return;
+    const protoCandidate = leaf ? Object.getPrototypeOf(leaf) : null;
+    const proto = isDetachableLeafPrototype(protoCandidate)
+      ? protoCandidate
+      : isDetachableLeafPrototype(WorkspaceLeaf.prototype)
+        ? WorkspaceLeaf.prototype
+        : null;
+    if (!proto) return;
 
     this.originalDetach = proto.detach;
     this.interceptedLeafProto = proto;

@@ -86,9 +86,14 @@ export class SaveLayoutModal extends Modal {
     const candidate = (group as SettingGroupLike).settingEl;
     if (candidate) return candidate;
 
-    const groups = typeof fallback.findAll === "function"
-      ? fallback.findAll(".setting-group")
-      : Array.from(fallback.querySelectorAll<HTMLElement>(".setting-group"));
+    const fallbackWithFindAll = fallback as HTMLElement & {
+      findAll?: (selector: string) => HTMLElement[];
+    };
+    const groups: HTMLElement[] = typeof fallbackWithFindAll.findAll === "function"
+      ? fallbackWithFindAll.findAll(".setting-group")
+      : Array.from(fallback.children)
+          .filter((child) => child.classList.contains("setting-group"))
+          .map((child) => child as HTMLElement);
     return groups[groups.length - 1] ?? fallback;
   }
 

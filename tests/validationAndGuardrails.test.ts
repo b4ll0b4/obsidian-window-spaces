@@ -289,7 +289,7 @@ describe("Validation & Auto-Save Guardrails (validationAndGuardrails.test.ts)", 
     expect(workspaceRestoreSpy).toHaveBeenCalledTimes(1);
   });
 
-  test("startup reconcile reapplies each identified space via target-only path", async () => {
+  test("startup reconcile only records native-restored spaces without applying layout", async () => {
     const irmWin = {
       closed: false,
       document: { body: { classList: { contains: (name: string) => name === "is-popout-window" } } },
@@ -316,18 +316,19 @@ describe("Validation & Auto-Save Guardrails (validationAndGuardrails.test.ts)", 
     };
     mockPlugin.settings.spaces = [layout1, layout2];
 
-    vi.spyOn(manager, "matchUnlabeledPopoutWindows").mockImplementation(() => {});
+    const matchSpy = vi.spyOn(manager, "matchUnlabeledPopoutWindows").mockImplementation(() => {});
     vi.spyOn(manager, "getLivePopoutWindows").mockReturnValue([irmWin, personalWin]);
     vi.spyOn(manager, "getLayoutNameForWindow")
       .mockImplementation((w) => (w === irmWin ? "IRM-1" : w === personalWin ? "Personal" : null));
     const inPlaceSpy = vi.spyOn(manager as any, "restoreOpenSpaceInPlace").mockResolvedValue(undefined);
-    const globalRestoreSpy = vi.spyOn(manager, "restoreLayout").mockResolvedValue(undefined);
 
     await manager.reconcileOpenSpacesOnStartup();
 
-    expect(inPlaceSpy).toHaveBeenCalledWith(layout1, irmWin, { showNotifications: false, skipGeometry: true });
-    expect(inPlaceSpy).toHaveBeenCalledWith(layout2, personalWin, { showNotifications: false, skipGeometry: true });
-    expect(globalRestoreSpy).not.toHaveBeenCalled();
+    expect(matchSpy).toHaveBeenCalledWith(false);
+    expect(inPlaceSpy).not.toHaveBeenCalled();
+    expect((manager as any).layoutWindows.get(layout1)).toBe(irmWin);
+    expect((manager as any).layoutWindows.get(layout2)).toBe(personalWin);
+    expect(manager.isRestoringLayout).toBe(false);
   });
 
   test("restore focuses the existing popout window for an already-open space when focusExistingWindow is set", async () => {
@@ -1513,4 +1514,161 @@ describe("findWindowForSavedLeaves coverage guard (Active badge accuracy)", () =
     expect(revealLeaf).toHaveBeenCalledWith(leafA);
     expect(setActiveLeaf).toHaveBeenCalledWith(leafA, { focus: false });
   });
+
+  test("buildSimpleWindowStructure 保留 tabs 的 Stack tabs 狀態", async () => {
+    const tabsParent = { setStacked: vi.fn() };
+    const targetWin = { document: { body: {} } } as unknown as Window;
+    const initialHeader = document.createElement("div");
+    initialHeader.style.cssText = "width: 200px; transition: width 200ms ease-in-out; opacity: 1;";
+    const leafAHeader = document.createElement("div");
+    leafAHeader.style.cssText = "width: 200px; transition: width 200ms ease-in-out; opacity: 1;";
+    const initialLeaf = { parent: tabsParent, tabHeaderEl: initialHeader };
+    const leafA = { parent: tabsParent, tabHeaderEl: leafAHeader };
+
+    mockPlugin.app.workspace = {
+      createLeafInParent: vi.fn().mockReturnValue(leafA),
+      createLeafBySplit: vi.fn(),
+      revealLeaf: vi.fn().mockResolvedValue(undefined),
+      setActiveLeaf: vi.fn(),
+      iterateAllLeaves: () => {},
+    };
+
+    vi.spyOn(manager as any, "getLeavesForWindow").mockReturnValue([initialLeaf]);
+    vi.spyOn(manager as any, "applyBuiltLeafState").mockResolvedValue(undefined);
+    vi.spyOn(manager as any, "applySavedSplitDimensions").mockImplementation(() => {});
+
+    await (manager as any).buildSimpleWindowStructure(targetWin, {
+      type: "window",
+      children: [{
+        type: "tabs",
+        stacked: true,
+        children: [
+          { type: "leaf", id: "l0", state: { type: "empty" } },
+          { type: "leaf", id: "l1", state: { type: "empty" } },
+        ],
+      }],
+    });
+
+    expect(tabsParent.setStacked).toHaveBeenCalledWith(true);
+    expect(initialHeader.style.width).toBe("");
+    expect(leafAHeader.style.width).toBe("");
+    expect(initialHeader.style.transition).toBe("");
+    expect(leafAHeader.style.opacity).toBe("");
+  });
+
+  test("refreshRestoredTabDisplays 同步 Stack tabs 的 presentation scrollLeft", () => {
+    const targetWin = {
+      closed: false,
+      setTimeout: vi.fn(),
+    } as unknown as Window;
+
+    const containerEl = {
+      clientWidth: 562,
+      scrollLeft: 0,
+    } as unknown as HTMLElement;
+
+    const child0 = {
+      tabHeaderEl: { offsetWidth: 40 } as unknown as HTMLElement,
+      containerEl: { offsetWidth: 442 } as unknown as HTMLElement,
+    };
+    const child1 = {
+      tabHeaderEl: { offsetWidth: 40 } as unknown as HTMLElement,
+      containerEl: { offsetWidth: 442 } as unknown as HTMLElement,
+    };
+    const child2 = {
+      tabHeaderEl: { offsetWidth: 40 } as unknown as HTMLElement,
+      containerEl: { offsetWidth: 442 } as unknown as HTMLElement,
+    };
+
+    const stackedTabsParent = {
+      isStacked: true,
+      currentTab: 1,
+      tabsContainerEl: containerEl,
+      children: [child0, child1, child2],
+      updateTabDisplay: vi.fn(),
+      scrollIntoView: vi.fn(),
+      onContainerScroll: vi.fn(),
+    };
+
+    const mockLeaf = {
+      parent: stackedTabsParent,
+    };
+
+    mockPlugin.app.workspace = {
+      iterateAllLeaves: (cb: (leaf: any) => void) => {
+        cb(mockLeaf);
+      },
+    };
+
+    vi.spyOn(manager as any, "getWindowForLeaf").mockReturnValue(targetWin);
+
+    (manager as any).refreshRestoredTabDisplays(targetWin, false);
+
+    expect(stackedTabsParent.updateTabDisplay).toHaveBeenCalled();
+    // 計算 target: r=80, a=522, o=40, u=442, h=442 -> target=442
+    expect(containerEl.scrollLeft).toBe(442);
+    expect(stackedTabsParent.onContainerScroll).toHaveBeenCalled();
+  });
+
+  test("refreshRestoredTabDisplays 對非 stacked tabs 或無尺寸容器保持防護", () => {
+    const targetWin = {
+      closed: false,
+      setTimeout: vi.fn(),
+    } as unknown as Window;
+
+    const normalContainerEl = {
+      clientWidth: 562,
+      scrollLeft: 0,
+    } as unknown as HTMLElement;
+
+    const normalTabsParent = {
+      isStacked: false,
+      currentTab: 1,
+      tabsContainerEl: normalContainerEl,
+      children: [
+        { tabHeaderEl: { offsetWidth: 40 }, containerEl: { offsetWidth: 442 } },
+        { tabHeaderEl: { offsetWidth: 40 }, containerEl: { offsetWidth: 442 } },
+      ],
+      updateTabDisplay: vi.fn(),
+      scrollIntoView: vi.fn(),
+      onContainerScroll: vi.fn(),
+    };
+
+    const zeroWidthContainerEl = {
+      clientWidth: 0,
+      scrollLeft: 0,
+    } as unknown as HTMLElement;
+
+    const zeroWidthStackedParent = {
+      isStacked: true,
+      currentTab: 1,
+      tabsContainerEl: zeroWidthContainerEl,
+      children: [
+        { tabHeaderEl: { offsetWidth: 40 }, containerEl: { offsetWidth: 442 } },
+        { tabHeaderEl: { offsetWidth: 40 }, containerEl: { offsetWidth: 442 } },
+      ],
+      updateTabDisplay: vi.fn(),
+      scrollIntoView: vi.fn(),
+      onContainerScroll: vi.fn(),
+    };
+
+    mockPlugin.app.workspace = {
+      iterateAllLeaves: (cb: (leaf: any) => void) => {
+        cb({ parent: normalTabsParent });
+        cb({ parent: zeroWidthStackedParent });
+      },
+    };
+
+    vi.spyOn(manager as any, "getWindowForLeaf").mockReturnValue(targetWin);
+
+    (manager as any).refreshRestoredTabDisplays(targetWin, false);
+
+    expect(normalTabsParent.updateTabDisplay).toHaveBeenCalled();
+    expect(normalContainerEl.scrollLeft).toBe(0);
+
+    expect(zeroWidthStackedParent.updateTabDisplay).toHaveBeenCalled();
+    expect(zeroWidthContainerEl.scrollLeft).toBe(0);
+    expect(zeroWidthStackedParent.onContainerScroll).not.toHaveBeenCalled();
+  });
 });
+

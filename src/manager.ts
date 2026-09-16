@@ -42,6 +42,8 @@ interface LayoutNode extends Record<string, unknown> {
   id?: string;
   direction?: string;
   currentTab?: number;
+  /** Obsidian's native "Stack tabs" state for a tabs group. */
+  stacked?: boolean;
   dimension?: number;
   state?: LayoutNodeState;
   children?: LayoutNode[];
@@ -164,47 +166,37 @@ export class WindowLayoutManager {
   }
 
   /**
-   * 啟動時對已由 Obsidian native workspace 還原的 Popout 做 target-only
-   * reconcile：只重建「結構與 snapshot 不一致」的目標視窗本身，絕不觸發
-   * 全域 changeLayout（clearLayout 會把其他 Popout 與主視窗全部 unload、
-   * detach、重建）。辨識成功的 space 依序處理；個別失敗僅 warn，不影響
-   * 其他視窗，失敗的視窗維持 native 還原結構（可由使用者手動 restore）。
+   * 啟動時只辨識 Obsidian native workspace 已還原的 Popout。
+   *
+   * Native workspace restore 已經是完整且正確的來源（包含 Stack tabs、
+   * active tab 與所有內部 presentation state），因此這裡絕對不能再呼叫
+   * restoreOpenSpaceInPlace() 或任何 layout rebuild。使用者手動 restore 時
+   * 才由 restoreLayoutInternal() 進行 startup shape comparison / target-only
+   * reconcile。
    */
   async reconcileOpenSpacesOnStartup(): Promise<void> {
-    this.matchUnlabeledPopoutWindows();
+    // Identification itself must stay presentation-only as well. In the
+    // unlikely case a native window was not labelable during plugin onload,
+    // suppress Activity Bar rendering here so startup still cannot touch the
+    // native-restored layout.
+    this.matchUnlabeledPopoutWindows(false);
 
-    // 依「label → 視窗」收集目前已辨識的 spaces（一個視窗一個 label）。
-    const identified = new Map<string, Window>();
+    // 依「label → 視窗」收集目前已辨識的 spaces（一個視窗一個 label），
+    // 僅建立 bookkeeping 對映；不要碰 native 還原的 layout。
+    const identified = new Map<string, { layout: WindowLayout; targetWin: Window }>();
     this.getLivePopoutWindows().forEach((targetWin) => {
       const layoutName = this.getLayoutNameForWindow(targetWin);
-      if (layoutName) identified.set(layoutName, targetWin);
+      if (!layoutName || targetWin.closed) return;
+      const layout = (this.plugin.settings.spaces || []).find(
+        (space: WindowLayout) => space.name === layoutName
+      );
+      if (layout) identified.set(layoutName, { layout, targetWin });
     });
 
     if (identified.size === 0) return;
 
-    this.isRestoringLayout = true;
-    try {
-      for (const [spaceName, targetWin] of identified) {
-        const layout = (this.plugin.settings.spaces || []).find(
-          (space: WindowLayout) => space.name === spaceName
-        );
-        if (!layout || targetWin.closed) continue;
-        try {
-          await this.restoreOpenSpaceInPlace(layout, targetWin, {
-            showNotifications: false,
-            // 啟動時不搬動視窗：Obsidian 已在關閉時的位置開啟它，
-            // 搬動只會造成重繪與位移；幾何由手動 restore 套用。
-            skipGeometry: true,
-          });
-          // leaf 層級重建可能改變頂層欄位數，重置活動列側欄 hints，避免
-          // integrity check 以重建前的 originalCount 誤判側欄缺失而重複補欄。
-          this.plugin.activityBars?.resetSidebarHints(targetWin);
-        } catch (error) {
-          console.warn(`[Window Spaces] Failed to reconcile startup space "${spaceName}":`, error);
-        }
-      }
-    } finally {
-      this.isRestoringLayout = false;
+    for (const { layout, targetWin } of identified.values()) {
+      this.layoutWindows.set(layout, targetWin);
     }
   }
 
@@ -257,12 +249,9 @@ export class WindowLayoutManager {
         savedLeaves,
         layout.workspace?.activeFile,
         true,
-        builtLeaves ?? undefined
+        builtLeaves ?? undefined,
+        true
       );
-
-    if (!builtLeaves) {
-      await this.restoreSavedTabSelections(targetWin, rootNode);
-    }
 
     if (builtLeaves && builtLeaves.length > 0) {
       this.applyPinnedStateToBuiltLeaves(builtLeaves, savedLeaves);
@@ -290,6 +279,15 @@ export class WindowLayoutManager {
     if (options.skipGeometry !== true) {
       this.restoreWindowGeometry(targetWin, layout.windowState, layout.includeGeometry, false);
     }
+
+    await this.restoreSavedTabSelections(
+      targetWin,
+      rootNode,
+      builtLeaves ?? undefined,
+      layout.workspace?.activeFile
+    );
+    this.refreshRestoredTabDisplays(targetWin);
+
     this.ensureDeferredViewsLoaded(targetWin);
     WindowLayoutsModal.renderAllInstances();
 
@@ -348,10 +346,17 @@ export class WindowLayoutManager {
    * changeLayout；revealLeaf/setActiveLeaf 會讓 Obsidian 更新對應 tabs
    * group 的 active leaf，而不會重建其他 WorkspaceWindow。
    */
-  private async restoreSavedTabSelections(targetWin: Window, rootNode: LayoutNode): Promise<void> {
+  private async restoreSavedTabSelections(
+    targetWin: Window,
+    rootNode: LayoutNode,
+    preferredLeaves?: WorkspaceLeaf[],
+    activeFilePath?: string
+  ): Promise<void> {
     if (!rootNode) return;
 
-    const liveLeaves = this.getLeavesForWindow(targetWin);
+    const liveLeaves = preferredLeaves && preferredLeaves.length > 0
+      ? preferredLeaves
+      : this.getLeavesForWindow(targetWin);
     let leafIndex = 0;
     const activeLeaves: WorkspaceLeaf[] = [];
 
@@ -366,20 +371,208 @@ export class WindowLayoutManager {
       const children = node.children.flatMap((child) => collectLeaves(child));
       if (node.type === "tabs" && children.length > 0) {
         const currentTab = typeof node.currentTab === "number" ? node.currentTab : 0;
-        const activeLeaf = children[Math.max(0, Math.min(currentTab, children.length - 1))];
-        if (activeLeaf) activeLeaves.push(activeLeaf);
+        const targetIndex = Math.max(0, Math.min(currentTab, children.length - 1));
+        const activeLeaf = children[targetIndex];
+        if (activeLeaf) {
+          activeLeaves.push(activeLeaf);
+          // INTERNAL API: WorkspaceTabs.currentTab / WorkspaceTabs.selectTabIndex / WorkspaceTabs.selectTab
+          // 局部更新 tabs group 的選中分頁，避免全域呼叫 revealLeaf/setActiveLeaf 引發多餘分頁切換與捲動競態。
+          const parent = (activeLeaf as unknown as ExtendedWorkspaceLeaf).parent as {
+            currentTab?: number;
+            selectTabIndex?: (index: number) => void;
+            selectTab?: (leaf: WorkspaceLeaf) => void;
+          } | undefined;
+          if (parent && parent.currentTab !== targetIndex) {
+            try {
+              if (typeof parent.selectTabIndex === "function") {
+                parent.selectTabIndex(targetIndex);
+              } else if (typeof parent.selectTab === "function") {
+                parent.selectTab(activeLeaf);
+              }
+            } catch {
+              // Ignore local selection error
+            }
+          }
+        }
       }
       return children;
     };
 
     collectLeaves(rootNode);
-    for (const leaf of activeLeaves) {
-      try {
-        await this.app.workspace.revealLeaf(leaf);
-        this.app.workspace.setActiveLeaf(leaf, { focus: false });
-      } catch {
-        // Ignore activation errors during native startup reconciliation.
+
+    // 將視窗焦點精確對齊至 saved activeFile 或主要內容分頁（全域唯一一次激活）
+    if (activeLeaves.length > 0) {
+      let primaryLeaf: WorkspaceLeaf | null = null;
+      if (activeFilePath) {
+        primaryLeaf = activeLeaves.find((leaf) => {
+          const path = (leaf.view as unknown as { file?: { path?: string } })?.file?.path ||
+            (typeof (leaf as unknown as ExtendedWorkspaceLeaf).getViewState === "function"
+              ? this.getFilePathFromLeafState((leaf as unknown as ExtendedWorkspaceLeaf).getViewState() || {})
+              : null);
+          return path === activeFilePath;
+        }) || null;
       }
+      if (!primaryLeaf) {
+        primaryLeaf = activeLeaves.find((leaf) => {
+          const root = (leaf as unknown as ExtendedWorkspaceLeaf).getRoot?.();
+          return root && root !== (this.app.workspace as ExtendedWorkspace).leftSplit &&
+            root !== (this.app.workspace as ExtendedWorkspace).rightSplit;
+        }) || activeLeaves[0];
+      }
+      if (primaryLeaf) {
+        try {
+          await this.app.workspace.revealLeaf(primaryLeaf);
+          this.app.workspace.setActiveLeaf(primaryLeaf, { focus: true });
+        } catch {
+          // Ignore activation error
+        }
+      }
+    }
+  }
+
+  /**
+   * Re-run the native Tabs display pass after view/file restoration. Opening a
+   * file and changing the global active leaf can happen after the leaf-level
+   * builder selected `currentTab`; refreshing here keeps the header and leaf
+   * presentation synchronized before the user clicks a stacked tab.
+   *
+   * INTERNAL API: WorkspaceTabs.updateTabDisplay / WorkspaceTabs.scrollIntoView /
+   * WorkspaceTabs.tabsContainerEl / WorkspaceTabs.onContainerScroll（d.ts 未宣告；
+   * Obsidian native WorkspaceTabs internal presentation methods & properties）。
+   * Chromium 在 Popout 視窗處於 background/hidden 狀態時會抑制 smooth 捲動動畫
+   * （原生 scrollIntoView 走 smooth），導致 restore 後 currentTab 與 scrollLeft 脫節。
+   * 直接依原生公式推導目標 scrollLeft 並賦值，可在不重建 layout 的前提下即時同步。
+   */
+  private refreshRestoredTabDisplays(targetWin: Window, scheduleRetry = true): void {
+    if (!targetWin || targetWin.closed) return;
+    const parents = new Set<{
+      updateTabDisplay?: () => void;
+      isStacked?: boolean;
+      currentTab?: number;
+      scrollIntoView?: (index: number) => void;
+      onContainerScroll?: () => void;
+      tabsContainerEl?: HTMLElement;
+      children?: Array<{
+        tabHeaderEl?: HTMLElement;
+        containerEl?: HTMLElement;
+      }>;
+    }>();
+    try {
+      const workspace = this.app.workspace as unknown as ExtendedWorkspace;
+      workspace.iterateAllLeaves((leaf: WorkspaceLeaf) => {
+        if (this.getWindowForLeaf(leaf) !== targetWin) return;
+        const parent = (leaf as unknown as ExtendedWorkspaceLeaf).parent as
+          | (typeof parents extends Set<infer T> ? T : never)
+          | undefined;
+        if (parent) {
+          parents.add(parent);
+        }
+      });
+      parents.forEach((parent) => {
+        try {
+          parent.updateTabDisplay?.();
+          this.syncStackedTabsScroll(parent);
+        } catch {
+          // Ignore version-specific display refresh failures.
+        }
+      });
+
+      if (scheduleRetry) {
+        targetWin.setTimeout(() => {
+          if (!targetWin || targetWin.closed) return;
+          this.refreshRestoredTabDisplays(targetWin, false);
+        }, 250);
+      }
+    } catch {
+      // Runtime iteration is optional; leave the already restored structure intact.
+    }
+  }
+
+  /**
+   * Synchronize the stacked tabs presentation scrollLeft to match Obsidian's
+   * native scrollIntoView target.
+   *
+   * INTERNAL API: WorkspaceTabs.scrollIntoView / WorkspaceTabs.tabsContainerEl /
+   * WorkspaceTabs.onContainerScroll (Obsidian internal stack tabs layout mechanism).
+   */
+  private syncStackedTabsScroll(parent: {
+    isStacked?: boolean;
+    currentTab?: number;
+    scrollIntoView?: (index: number) => void;
+    onContainerScroll?: () => void;
+    tabsContainerEl?: HTMLElement;
+    children?: Array<{
+      tabHeaderEl?: HTMLElement;
+      containerEl?: HTMLElement;
+    }>;
+  }): void {
+    if (parent.isStacked !== true) return;
+    try {
+      const targetScroll = this.computeStackedTargetScrollLeft(parent);
+      if (targetScroll !== null && parent.tabsContainerEl) {
+        if (Math.abs(parent.tabsContainerEl.scrollLeft - targetScroll) > 1) {
+          parent.tabsContainerEl.scrollLeft = targetScroll;
+          parent.onContainerScroll?.();
+        }
+      }
+    } catch {
+      // Presentation scroll sync is optional; ignore failures.
+    }
+  }
+
+  /**
+   * Compute the native WorkspaceTabs.scrollIntoView(currentTab) target offset.
+   * Native formula extracted from obsidian.asar WorkspaceTabs.prototype.scrollIntoView:
+   *   u = a - r (left limit)
+   *   h = a + activeLeaf.containerEl.offsetWidth - container.clientWidth + o (right limit)
+   *   scrollLeft < h ? h : (scrollLeft > u ? u : scrollLeft)
+   */
+  private computeStackedTargetScrollLeft(parent: {
+    tabsContainerEl?: HTMLElement;
+    currentTab?: number;
+    children?: Array<{
+      tabHeaderEl?: HTMLElement;
+      containerEl?: HTMLElement;
+    }>;
+  }): number | null {
+    try {
+      const children = parent.children;
+      const container = parent.tabsContainerEl;
+      if (!children || !container || children.length === 0) return null;
+      const index = typeof parent.currentTab === "number" ? parent.currentTab : 0;
+      if (index === 0) return 0;
+      const activeLeaf = children[index];
+      if (!activeLeaf) return null;
+
+      const clientWidth = container.clientWidth;
+      if (clientWidth <= 0) return null;
+
+      let r = 0;
+      let o = 0;
+      let a = 0;
+      for (let s = 0; s < children.length; s++) {
+        const child = children[s];
+        const headerWidth = child.tabHeaderEl?.offsetWidth ?? 0;
+        if (s <= index) {
+          r += headerWidth;
+          a += headerWidth;
+          if (s < index) {
+            a += child.containerEl?.offsetWidth ?? 0;
+          }
+        } else {
+          o += headerWidth;
+        }
+      }
+      const u = a - r;
+      const activeLeafWidth = activeLeaf.containerEl?.offsetWidth ?? 0;
+      const h = a + activeLeafWidth - clientWidth + o;
+      const currentScroll = container.scrollLeft;
+
+      if (currentScroll < h) return h;
+      if (currentScroll > u) return u;
+      return currentScroll;
+    } catch {
+      return null;
     }
   }
 
@@ -421,6 +614,12 @@ export class WindowLayoutManager {
       normalized.viewType = typeof state.type === "string" ? state.type : null;
       return normalized;
     }
+
+    // `stacked` is a presentation property of a tabs group, but it is part
+    // of the native workspace snapshot and must participate in the startup
+    // shape comparison. If it differs, the target-only rebuild path below
+    // will recreate the tabs group and apply the saved Stack tabs state.
+    if (node.type === "tabs") normalized.stacked = node.stacked === true;
 
     if (typeof node.direction === "string") normalized.direction = node.direction;
     if (Array.isArray(node.children)) {
@@ -691,7 +890,12 @@ export class WindowLayoutManager {
     }
   }
 
-  matchUnlabeledPopoutWindows(): void {
+  /**
+   * Match unlabeled native Popouts to saved Spaces. `renderActivityBars=false`
+   * is used during startup identification so matching cannot trigger any
+   * presentation/layout pass before the user explicitly restores a Space.
+   */
+  matchUnlabeledPopoutWindows(renderActivityBars = true): void {
     if (this.isMatchingUnlabeled) return;
     this.isMatchingUnlabeled = true;
     try {
@@ -888,7 +1092,7 @@ export class WindowLayoutManager {
         // 相同的檔案」就被誤匹配（例如 Folder Spaces open in new window 點檔後）。
         if (bestSpace && !bestScoreAmbiguous && bestScore >= (bestStrongHit ? 10 : 30)) {
           claimedLayoutNames.add(bestSpace.name);
-          this.setLayoutLabelForWindow(win, bestSpace.name);
+          this.setLayoutLabelForWindow(win, bestSpace.name, renderActivityBars);
           this.layoutWindows.set(bestSpace, win);
           // 回寫識別記號：使下次重啟直接命中 leafIdMarker，不再依賴內容比對
           this.syncWindowLeafMarker(win, bestSpace);
@@ -1462,6 +1666,7 @@ export class WindowLayoutManager {
       ...(typeof col.id === "string" ? { id: col.id } : {}),
       children: real.length > 0 ? real : [{ type: "leaf", state: { type: "empty", state: {} } }],
       ...(typeof col.currentTab === "number" ? { currentTab: 0 } : {}),
+      ...(col.stacked === true ? { stacked: true } : {}),
     };
   }
 
@@ -1908,16 +2113,20 @@ export class WindowLayoutManager {
           if (activeLeaf && freshLeaves.includes(activeLeaf)) {
             targetLeaf = activeLeaf;
           } else {
-            targetLeaf = freshLeaves[0];
+            targetLeaf = this.getActiveLeafInWindow(targetWin) || freshLeaves[0];
           }
         }
 
         if (targetLeaf) {
-          await this.app.workspace.revealLeaf(targetLeaf);
-          // revealLeaf() is asynchronous; the user may have switched to the
-          // main window while it was pending. Never steal that focus back.
-          if (!this.isWindowFocused(targetWin)) return;
-          this.app.workspace.setActiveLeaf(targetLeaf, { focus: focusWindow });
+          const currentActive = typeof this.app.workspace.getMostRecentLeaf === "function"
+            ? this.app.workspace.getMostRecentLeaf()
+            : (this.app.workspace as ExtendedWorkspace).activeLeaf;
+          // 若目標 leaf 已經是全域 activeLeaf，不需要重複 revealLeaf 造成畫面抖動
+          if (currentActive !== targetLeaf) {
+            await this.app.workspace.revealLeaf(targetLeaf);
+            if (!this.isWindowFocused(targetWin)) return;
+            this.app.workspace.setActiveLeaf(targetLeaf, { focus: focusWindow });
+          }
         }
       } catch {
         // Ignore focus error
@@ -1943,24 +2152,39 @@ export class WindowLayoutManager {
   }
 
   /**
-   * 取得指定視窗內「目前 active 的 tab」leaf（依 tab header 的 is-active class）。
-   * 全域 activeLeaf 可能指向其他視窗（例如使用者已切回主視窗），此時不該
-   * fallback 到視窗內第一個 leaf，以免把第一個 tab 搶成 active。
+   * 取得指定視窗內「目前 active 的 tab」leaf（依 tab header 的 is-active / mod-active class）。
+   * 優先尋找主內容區（非側欄）的 active leaf，避免被側欄（如 Bookmarks/Outline）劫持焦點。
    */
   private getActiveLeafInWindow(targetWin: Window): WorkspaceLeaf | null {
     const workspace = this.app.workspace as unknown as ExtendedWorkspace;
     if (typeof workspace.iterateAllLeaves !== "function") return null;
-    let found: WorkspaceLeaf | null = null;
+
+    const currentActive = typeof this.app.workspace.getMostRecentLeaf === "function"
+      ? this.app.workspace.getMostRecentLeaf()
+      : workspace.activeLeaf;
+    if (currentActive && (currentActive as unknown as ExtendedWorkspaceLeaf).containerEl?.ownerDocument?.defaultView === targetWin) {
+      return currentActive;
+    }
+
+    let foundMain: WorkspaceLeaf | null = null;
+    let foundAny: WorkspaceLeaf | null = null;
     workspace.iterateAllLeaves((leaf: WorkspaceLeaf) => {
-      if (found) return;
       const extLeaf = leaf as unknown as ExtendedWorkspaceLeaf;
       if (extLeaf.containerEl?.ownerDocument?.defaultView !== targetWin) return;
       const tabEl = (extLeaf as { tabHeaderEl?: HTMLElement }).tabHeaderEl;
-      if (tabEl && tabEl.classList.contains("is-active")) {
-        found = leaf;
+      const isTabActive = tabEl && (tabEl.classList.contains("is-active") || tabEl.classList.contains("mod-active"));
+      if (isTabActive) {
+        const root = extLeaf.getRoot?.();
+        const isSidebar = root === workspace.leftSplit || root === workspace.rightSplit;
+        if (!isSidebar && !foundMain) {
+          foundMain = leaf;
+        }
+        if (!foundAny) {
+          foundAny = leaf;
+        }
       }
     });
-    return found;
+    return foundMain || foundAny;
   }
 
   /**
@@ -2526,7 +2750,8 @@ export class WindowLayoutManager {
           savedLeaves,
           layout.workspace?.activeFile,
           builtLeaves !== null,
-          builtLeaves ?? undefined
+          builtLeaves ?? undefined,
+          true
         );
       }
 
@@ -2564,6 +2789,16 @@ export class WindowLayoutManager {
         // 校正檔案開啟期間可能出現的微幅偏移，避免無謂地移動已就位的視窗。
         this.restoreWindowGeometry(targetWin, layout.windowState, layout.includeGeometry, false);
 
+        const rootNode = this.extractLayoutRootNode(layout.workspace?.layout);
+        if (rootNode) {
+          await this.restoreSavedTabSelections(
+            targetWin,
+            rootNode,
+            builtLeaves ?? undefined,
+            layout.workspace?.activeFile
+          );
+        }
+
         // 若使用者在 restore 的非同步等待期間已切回主視窗，就不能再把全域
         // activeLeaf 指到 popout leaf，否則下一次主視窗 File Explorer 點擊
         // note 會被導向 popout（需點兩下才切換）。僅當 popout 仍持有焦點、
@@ -2580,15 +2815,30 @@ export class WindowLayoutManager {
         const winLeaves = this.getLeavesForWindow(targetWin);
         if (winLeaves.length > 0 && canActivatePopout) {
           // restoreFileStatesForWindow 已把 active 設到 layout 保存時選中的
-          // tab（activeFile 對應的 leaf，fallback 第一個 leaf）。此處只在全域
-          // activeLeaf 尚未指向此 popout 時才設定，避免把 active 搶到第一個
-          // column 的第一個 tab，導致原本選中的 tab 失去 active。
+          // tab（activeFile 對應的 leaf，fallback 第一個 leaf）。一般情況只
+          // 在全域 activeLeaf 尚未指向此 popout 時設定；但 Stack tabs 若在
+          // popout 尚未 focus 時設定 active，Obsidian 可能只更新 currentTab，
+          // 未補上 header/leaf 的 mod-active presentation class，導致第一次
+          // 點該 tab 不會展開。偵測此特例後以同一個 active leaf 補做一次
+          // focus=true activation，不會把已選中的 Stack tab 改成第一個 leaf。
           const activeLeaf = typeof this.app.workspace.getMostRecentLeaf === "function"
             ? this.app.workspace.getMostRecentLeaf()
             : (this.app.workspace as ExtendedWorkspace).activeLeaf;
-          if (!activeLeaf || !winLeaves.includes(activeLeaf)) {
+          const activeLeafInWindow = activeLeaf && winLeaves.includes(activeLeaf)
+            ? activeLeaf
+            : null;
+          const activeLeafExt = activeLeafInWindow as unknown as {
+            parent?: { isStacked?: boolean };
+            tabHeaderEl?: HTMLElement;
+            containerEl?: HTMLElement;
+          } | null;
+          const activePresentationMissing = activeLeafExt?.parent?.isStacked === true &&
+            (!activeLeafExt.tabHeaderEl?.classList.contains("mod-active") ||
+              !activeLeafExt.containerEl?.classList.contains("mod-active"));
+          const leafToActivate = activeLeafInWindow || winLeaves[0];
+          if (leafToActivate && (!activeLeafInWindow || activePresentationMissing)) {
             try {
-              this.app.workspace.setActiveLeaf(winLeaves[0], { focus: true });
+              this.app.workspace.setActiveLeaf(leafToActivate, { focus: true });
             } catch {
               // Ignore focus error
             }
@@ -2612,6 +2862,7 @@ export class WindowLayoutManager {
         if (isNewlyCreatedWindow) {
           this.scheduleNewPopoutFocus(targetWin);
         }
+        this.refreshRestoredTabDisplays(targetWin);
       }
 
       WindowLayoutsModal.renderAllInstances();
@@ -3237,6 +3488,12 @@ export class WindowLayoutManager {
             : [];
       const groupLeaves: WorkspaceLeaf[] = [];
       let last: WorkspaceLeaf = leaf;
+      // Native deserialization enables Stack tabs before inserting children.
+      // Match that order here so createLeafInParent() does not run the regular
+      // tab-width animation and leave a width: 200px inline override behind.
+      if (node.type === "tabs") {
+        this.prepareStackedStateForInsertion(leaf, node.stacked === true);
+      }
       for (let i = 0; i < leafNodes.length; i++) {
         if (i > 0) {
           const parent = (last as unknown as ExtendedWorkspaceLeaf).parent;
@@ -3252,6 +3509,28 @@ export class WindowLayoutManager {
         groupLeaves.push(last);
         built.push(last);
       }
+      // Re-apply after insertion because Obsidian may update the header while
+      // each child is attached; then remove any animation declarations that
+      // still override the native stacked width.
+      if (node.type === "tabs" && groupLeaves.length > 0) {
+        const stacked = node.stacked === true;
+        this.applyStackedStateToTabs(groupLeaves[0], stacked);
+        if (stacked) {
+          groupLeaves.forEach((groupLeaf) => {
+            this.clearStackedTabHeaderAnimationStyles(groupLeaf);
+          });
+          // `updateTabDisplay()` can enqueue one final animation pass after
+          // the child insertion call returns. Clear once more after the
+          // native 200ms tab-width transition has settled.
+          if (typeof targetWin.setTimeout === "function") {
+            targetWin.setTimeout(() => {
+              groupLeaves.forEach((groupLeaf) => {
+                this.clearStackedTabHeaderAnimationStyles(groupLeaf);
+              });
+            }, 250);
+          }
+        }
+      }
       // 恢復 saved layout 的 currentTab（該 tab group 保存時選中的 tab）。
       // leaf 層級重建預設會把 group 的 active tab 落在建立順序的預設值，
       // 造成「第一個 column 的第一個 tab 被特別 active、原本選中的 tab
@@ -3264,12 +3543,23 @@ export class WindowLayoutManager {
         const currentTab = typeof node.currentTab === "number" ? node.currentTab : 0;
         const activeIndex = Math.max(0, Math.min(currentTab, groupLeaves.length - 1));
         const groupActive = groupLeaves[activeIndex];
-        if (groupActive) {
+        const parent = (groupLeaves[0] as unknown as ExtendedWorkspaceLeaf).parent as {
+          selectTabIndex?: (index: number) => void;
+          selectTab?: (leaf: WorkspaceLeaf) => void;
+          currentTab?: number;
+        } | undefined;
+        if (parent && parent.currentTab !== activeIndex) {
           try {
-            await workspace.revealLeaf(groupActive);
-            workspace.setActiveLeaf(groupActive, { focus: false });
+            if (typeof parent.selectTabIndex === "function") {
+              parent.selectTabIndex(activeIndex);
+            } else if (typeof parent.selectTab === "function" && groupActive) {
+              parent.selectTab(groupActive);
+            } else if (groupActive) {
+              await workspace.revealLeaf(groupActive);
+              workspace.setActiveLeaf(groupActive, { focus: false });
+            }
           } catch {
-            // Ignore focus/activation error during structure build
+            // Ignore local selection error during structure build
           }
         }
       }
@@ -3343,6 +3633,108 @@ export class WindowLayoutManager {
     this.applySavedSplitDimensions(targetWin, rootNode);
 
     return built;
+  }
+
+  /**
+   * 套用 Obsidian tabs group 的 Stack tabs 狀態。
+   *
+   * INTERNAL API: WorkspaceTabs.setStacked（d.ts 未宣告；由原生 Stack tabs
+   * command 使用）。以 optional runtime detection 保留跨版本 fallback；
+   * DOM class 只作為最後的視覺 fallback，若 API 不存在不阻斷 restore。
+   */
+  private applyStackedStateToTabs(leaf: WorkspaceLeaf, stacked: boolean): void {
+    const parent = (leaf as unknown as ExtendedWorkspaceLeaf).parent as
+      | {
+          setStacked?: (value: boolean) => void;
+          isStacked?: boolean;
+          containerEl?: HTMLElement;
+        }
+      | undefined;
+    if (!parent) return;
+
+    if (typeof parent.setStacked === "function") {
+      try {
+        parent.setStacked(stacked);
+        if (stacked) this.clearStackedTabHeaderAnimationStyles(leaf);
+        return;
+      } catch {
+        // Continue with the compatibility fallback below.
+      }
+    }
+
+    if ("isStacked" in parent) {
+      try {
+        parent.isStacked = stacked;
+      } catch {
+        // Ignore read-only implementations.
+      }
+    }
+    parent.containerEl?.classList.toggle("mod-stacked", stacked);
+    if (stacked) this.clearStackedTabHeaderAnimationStyles(leaf);
+  }
+
+  /**
+   * Native deserialization calls setStacked() while a Tabs group is still
+   * empty. A placeholder leaf already exists on the leaf-level rebuild path,
+   * so calling setStacked() here would animate that first header as a regular
+   * tab before children are inserted. Set the internal flag/class directly in
+   * this pre-insertion case; the normal API path remains the fallback when the
+   * runtime shape is different.
+   */
+  private prepareStackedStateForInsertion(leaf: WorkspaceLeaf, stacked: boolean): void {
+    const parent = (leaf as unknown as ExtendedWorkspaceLeaf).parent as
+      | {
+          children?: unknown[];
+          setStacked?: (value: boolean) => void;
+          isStacked?: boolean;
+          containerEl?: HTMLElement;
+        }
+      | undefined;
+    if (!parent) return;
+
+    const hasExistingChildren = Array.isArray(parent.children) && parent.children.length > 0;
+    if (hasExistingChildren) {
+      let assigned = false;
+      try {
+        parent.isStacked = stacked;
+        assigned = parent.isStacked === stacked;
+      } catch {
+        // Continue with the API fallback below when the property is read-only.
+      }
+      if (assigned) {
+        parent.containerEl?.classList.toggle("mod-stacked", stacked);
+        return;
+      }
+    }
+
+    this.applyStackedStateToTabs(leaf, stacked);
+  }
+
+  /**
+   * `createLeafInParent()` may leave the regular-tab width animation inline on
+   * each header. Native deserialization enables Stack tabs before inserting
+   * children, so those declarations are never produced there. Remove only
+   * the animation properties that override Obsidian's stacked CSS width;
+   * native left/right sticky positioning is intentionally preserved.
+   */
+  private clearStackedTabHeaderAnimationStyles(leaf: WorkspaceLeaf): void {
+    const extLeaf = leaf as unknown as ExtendedWorkspaceLeaf & {
+      tabHeaderEl?: HTMLElement;
+      parent?: { tabHeaderEls?: HTMLElement[] };
+    };
+    const headers = new Set<HTMLElement>();
+    if (extLeaf.tabHeaderEl) headers.add(extLeaf.tabHeaderEl);
+    const parentHeaders = extLeaf.parent?.tabHeaderEls;
+    if (Array.isArray(parentHeaders)) {
+      parentHeaders.forEach((header) => headers.add(header));
+    }
+    headers.forEach((header) => {
+      if (!header?.style) return;
+      header.style.removeProperty("width");
+      header.style.removeProperty("transition");
+      header.style.removeProperty("transition-property");
+      header.style.removeProperty("opacity");
+    });
   }
 
   /**
@@ -3883,7 +4275,8 @@ export class WindowLayoutManager {
     leaves: ViewState[],
     activeFilePath?: string,
     skipUnchanged = false,
-    preferredLeaves?: WorkspaceLeaf[]
+    preferredLeaves?: WorkspaceLeaf[],
+    skipFocus = false
   ): Promise<string[]> {
     const currentWin = targetWin || (typeof activeWindow !== "undefined" ? activeWindow : window);
     const windowLeaves = await this.waitForWindowLeaves(currentWin, leaves.length);
@@ -3983,7 +4376,7 @@ export class WindowLayoutManager {
             currentFilePath === filePath &&
             (!viewMode || currentViewMode === viewMode)
           ) {
-            if (activeFilePath && filePath === activeFilePath) {
+            if (activeFilePath && filePath === activeFilePath && !targetActiveLeaf) {
               targetActiveLeaf = targetLeaf;
             }
             continue;
@@ -3995,7 +4388,7 @@ export class WindowLayoutManager {
           }
           await targetLeaf.openFile(file, openOptions);
 
-          if (activeFilePath && filePath === activeFilePath) {
+          if (activeFilePath && filePath === activeFilePath && !targetActiveLeaf) {
             targetActiveLeaf = targetLeaf;
           }
         }
@@ -4018,34 +4411,36 @@ export class WindowLayoutManager {
       progressNotice.hide();
     }
 
-    const leafToFocus = targetActiveLeaf || null;
-    if (leafToFocus) {
-      try {
-        await this.app.workspace.revealLeaf(leafToFocus);
-        this.app.workspace.setActiveLeaf(leafToFocus, { focus: true });
-        const focusContainer = (leafToFocus as unknown as ExtendedWorkspaceLeaf).containerEl;
-        if (focusContainer && typeof focusContainer.focus === "function") {
-          focusContainer.focus();
+    if (!skipFocus) {
+      const leafToFocus = targetActiveLeaf || null;
+      if (leafToFocus) {
+        try {
+          await this.app.workspace.revealLeaf(leafToFocus);
+          this.app.workspace.setActiveLeaf(leafToFocus, { focus: true });
+          const focusContainer = (leafToFocus as unknown as ExtendedWorkspaceLeaf).containerEl;
+          if (focusContainer && typeof focusContainer.focus === "function") {
+            focusContainer.focus();
+          }
+        } catch (e) {
+          console.warn("Failed to set active leaf:", e);
         }
-      } catch (e) {
-        console.warn("Failed to set active leaf:", e);
-      }
-    } else {
-      // 無 activeFile 時不要 fallback 到 windowLeaves[0]：leaf 層級重建
-      // （fillTabs 已恢復各 tab group 的 currentTab）或 changeLayout 已把
-      // active 指到視窗內的 leaf。此處只在 active 完全未指向此視窗時才補指，
-      // 避免把第一個 column 的第一個 tab 搶成 active（原本選中的 tab lost active）。
-      const currentActive = typeof this.app.workspace.getMostRecentLeaf === "function"
-        ? this.app.workspace.getMostRecentLeaf()
-        : (this.app.workspace as ExtendedWorkspace).activeLeaf;
-      if (!currentActive || !windowLeaves.includes(currentActive)) {
-        const fallbackLeaf = windowLeaves[0] || null;
-        if (fallbackLeaf) {
-          try {
-            await this.app.workspace.revealLeaf(fallbackLeaf);
-            this.app.workspace.setActiveLeaf(fallbackLeaf, { focus: true });
-          } catch (e) {
-            console.warn("Failed to set active leaf:", e);
+      } else {
+        // 無 activeFile 時不要 fallback 到 windowLeaves[0]：leaf 層級重建
+        // （fillTabs 已恢復各 tab group 的 currentTab）或 changeLayout 已把
+        // active 指到視窗內的 leaf。此處只在 active 完全未指向此視窗時才補指，
+        // 避免把第一個 column 的第一個 tab 搶成 active（原本選中的 tab lost active）。
+        const currentActive = typeof this.app.workspace.getMostRecentLeaf === "function"
+          ? this.app.workspace.getMostRecentLeaf()
+          : (this.app.workspace as ExtendedWorkspace).activeLeaf;
+        if (!currentActive || !windowLeaves.includes(currentActive)) {
+          const fallbackLeaf = windowLeaves[0] || null;
+          if (fallbackLeaf) {
+            try {
+              await this.app.workspace.revealLeaf(fallbackLeaf);
+              this.app.workspace.setActiveLeaf(fallbackLeaf, { focus: true });
+            } catch (e) {
+              console.warn("Failed to set active leaf:", e);
+            }
           }
         }
       }
