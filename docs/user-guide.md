@@ -93,7 +93,7 @@ Window Spaces employs **safe focus interception** so you can navigate and trigge
 | `Shift + Enter` | **Apply to Current Window** | Restores the selected space layout directly into the current window |
 | `Esc` | Dismiss / Unfocus | Closes the modal or releases search focus |
 
-> **Safety Guarantee**: Arrow keys and action shortcuts are captured only when the Window Spaces panel is actively focused. They never interfere with editing markdown notes, searching your vault, or using other modals.
+> **Safety Guarantee**: Key ownership is delegated to Obsidian's native Scope mechanism — the panel (sidebar or editor tab) uses a View scope, so it only receives keys while it is Obsidian's active leaf, and the floating switcher uses its host Modal's scope. As a result the panel responds to `↑` / `↓` whenever it has focus (including when you merely clicked the panel and its search input does not hold keyboard focus), while the Quick Switcher, the command palette, dropdown menus, and any other dialog automatically take precedence and are never intercepted.
 
 ---
 

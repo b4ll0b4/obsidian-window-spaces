@@ -93,7 +93,7 @@ Window Spaces 采用**精确焦点拦截技术**，让你在完全不使用鼠�
 | `Shift + Enter` | **应用至当前窗口** | 将选取的 Space 直接载入至当前的窗口中 |
 | `Esc` | 关闭面板 / 退出焦点 | 关闭浮动窗口或退出搜索焦点 |
 
-> **安全机制**：方向键与快捷操作仅在 Window Spaces 面板获得焦点时生效；当你在编辑笔记、搜索笔记库或使用其他插件时，Window Spaces 绝不拦截任何键盘事件。
+> **安全机制**：按键归属交由 Obsidian 原生的 Scope 机制决定——面板（侧边栏或编辑区分页）使用 View scope，只有当它是 Obsidian 的 active leaf 时才接管按键；浮动 Switcher 则使用原生 Modal 的 scope。因此只要面板取得焦点（包含仅以鼠标点击面板、输入框未取得键盘焦点的情况），`↑` / `↓` 即可操作；而 Quick Switcher、命令面板、下拉菜单或其他对话框打开时，它们的 scope 会自动压在上层，Window Spaces 绝不拦截任何按键。
 
 ---
 
