@@ -1,4 +1,5 @@
-import { App, Modal, Notice, Setting, setIcon, setTooltip, Menu } from "obsidian";
+import { App, Modal, Notice, Scope, Setting, setIcon, setTooltip, Menu } from "obsidian";
+import type { KeymapEventHandler } from "obsidian";
 import { WindowLayout, ViewState, WindowSettings } from "../types";
 import { t } from "../i18n";
 import WindowSpacesPlugin from "../main";
@@ -16,9 +17,8 @@ export class WindowLayoutsModal extends Modal {
   private filteredLayouts: WindowLayout[] = [];
   private selectedIndex = 0;
 
-  private keydownListener?: (event: KeyboardEvent) => void;
-  private keydownTarget?: Window | Document | HTMLElement;
-  private isPanelActive?: () => boolean;
+  private boundScope?: Scope;
+  private scopeHandlers?: KeymapEventHandler[];
   private panelRootEl?: HTMLElement;
   private panelMode = false;
   private externalHostClose?: () => void;
@@ -71,7 +71,7 @@ export class WindowLayoutsModal extends Modal {
     } catch (err: unknown) {
       console.error("[WindowSpaces] Error during WindowLayoutsModal onOpen:", err);
       WindowLayoutsModal.activeInstances.delete(this);
-      this.removeKeydownListener();
+      this.unbindScope();
       // Keep the native Modal alive and visibly report the failure. Closing a
       // Modal while Obsidian is still running Modal.open()/onOpen() can leave
       // its keyboard scope above the Command Palette scope.
@@ -88,17 +88,12 @@ export class WindowLayoutsModal extends Modal {
    * The modal instance is intentionally kept as the controller so the panel
    * and modal always expose the same layout actions and keyboard behavior.
    */
-  mountInContainer(
-    rootEl: HTMLElement,
-    isSidebar?: boolean,
-    isPanelActive?: () => boolean
-  ): void {
+  mountInContainer(rootEl: HTMLElement, isSidebar?: boolean): void {
     // Keep the optional argument for compatibility with older callers. The
     // panel UI is deliberately identical in editor tabs and sidebars.
     void isSidebar;
     WindowLayoutsModal.activeInstances.add(this);
     this.panelRootEl = rootEl;
-    this.isPanelActive = isPanelActive;
     this.panelMode = true;
     this.renderContent();
   }
@@ -113,7 +108,6 @@ export class WindowLayoutsModal extends Modal {
   mountInModalContainer(rootEl: HTMLElement, closeHost: () => void): void {
     WindowLayoutsModal.activeInstances.add(this);
     this.panelRootEl = rootEl;
-    this.isPanelActive = undefined;
     this.panelMode = false;
     this.externalHostClose = closeHost;
     this.renderContent();
@@ -121,34 +115,101 @@ export class WindowLayoutsModal extends Modal {
 
   unmountFromContainer(): void {
     WindowLayoutsModal.activeInstances.delete(this);
-    this.removeKeydownListener();
+    this.unbindScope();
     this.panelRootEl?.empty();
     this.panelRootEl = undefined;
-    this.isPanelActive = undefined;
     this.panelMode = false;
     this.externalHostClose = undefined;
   }
 
-  private getRootEl(): HTMLElement {
-    return this.panelRootEl || this.contentEl;
+  /**
+   * 將鍵盤處理交給 Obsidian Scope。
+   *
+   * - Sidebar / Tab panel：宿主傳入 `ItemView.scope`（View scope）。Obsidian 只在該 leaf
+   *   是 activeLeaf 時查詢它，因此「panel 取得 mouse focus 但輸入框沒有 keyboard focus」
+   *   的情況自然成立（不需要手動判斷焦點或 active leaf）。
+   * - Popup picker：宿主傳入 `Modal.scope`（Stack scope）。Modal.open 會把它推到該視窗
+   *   的 scope 堆疊頂端；Quick Switcher / Menu / 其他 modal 推上自己的 scope 時本元件
+   *   自動讓位，因此不需要 overlay / menu / hasFocus 等啟發式條件。
+   *
+   * 回傳 false 表示吃掉該鍵（Obsidian 會 preventDefault + stopPropagation）。
+   */
+  bindScope(scope: Scope): void {
+    this.unbindScope();
+    this.boundScope = scope;
+    this.scopeHandlers = [
+      scope.register([], "ArrowDown", (evt: KeyboardEvent) => this.handleScopeKey(evt, 1, false)),
+      scope.register([], "ArrowUp", (evt: KeyboardEvent) => this.handleScopeKey(evt, -1, false)),
+      scope.register([], "Enter", (evt: KeyboardEvent) => this.handleScopeKey(evt, 0, false)),
+      scope.register(["Shift"], "Enter", (evt: KeyboardEvent) => this.handleScopeKey(evt, 0, true)),
+    ];
+  }
+
+  unbindScope(): void {
+    const scope = this.boundScope;
+    if (scope && this.scopeHandlers) {
+      for (const handler of this.scopeHandlers) {
+        scope.unregister(handler);
+      }
+    }
+    this.boundScope = undefined;
+    this.scopeHandlers = undefined;
   }
 
   /**
-   * Find the .modal-container that hosts this instance, if any. Panels hosted
-   * in sidebars or editor tabs return null; popup pickers mounted inside a
-   * native Modal return that modal's container so stacked modals (rename
-   * dialog, Command Palette, ...) can be told apart from the picker itself.
+   * Scope 按鍵進入點（由 Obsidian keymap 呼叫）。
+   * undefined = 放行，false = 吃掉。
    */
-  private getOwnModalContainer(): HTMLElement | null {
-    let el: HTMLElement | null = this.getRootEl();
-    const doc = el?.ownerDocument;
-    while (el && doc && el !== doc.documentElement) {
-      if (typeof el.classList?.contains === "function" && el.classList.contains("modal-container")) {
-        return el;
-      }
-      el = el.parentElement;
+  private handleScopeKey(
+    event: KeyboardEvent,
+    direction: -1 | 0 | 1,
+    shift: boolean
+  ): boolean | undefined {
+    // IME 組字中的 Enter 是候選字確認，絕不可攔。
+    if (event.isComposing) return undefined;
+
+    const rootEl = this.getRootEl();
+    const activeEl = (rootEl?.ownerDocument?.activeElement as HTMLElement | null) ?? null;
+
+    // panel 內其他可編輯元素（例如 inline section rename 輸入框）有自己的按鍵處理，一律放行。
+    if (this.ownsEditingTarget(activeEl, rootEl)) return undefined;
+
+    if (direction !== 0) {
+      this.handleArrowKey(direction);
+      return false;
     }
-    return null;
+
+    // 焦點在按鈕上時，Enter 交給按鈕自己的原生行為。
+    if (activeEl && activeEl.tagName === "BUTTON") return undefined;
+
+    const rawQuery = this.searchInput?.value.trim() || "";
+    // 高亮（方向鍵）是以 renderedLayoutEntries 的渲染順序移動；分組檢視下
+    // 該順序與 filteredLayouts（排序順序）不同，必須以渲染順序取選中的 layout。
+    const entry = this.renderedLayoutEntries[this.selectedIndex >= 0 ? this.selectedIndex : 0];
+    const selectedLayout = entry ? entry.layout : this.filteredLayouts[0];
+    if (selectedLayout) {
+      void this.restoreLayout(selectedLayout, !shift);
+    } else if (rawQuery) {
+      void this.createAndSaveLayout(rawQuery, !shift);
+    }
+    return false;
+  }
+
+  /** 焦點是否落在本元件內「搜尋框以外」的可編輯元素上。 */
+  private ownsEditingTarget(activeEl: HTMLElement | null, rootEl: HTMLElement): boolean {
+    if (!activeEl || activeEl === this.searchInput) return false;
+    if (!rootEl || !rootEl.contains(activeEl)) return false;
+    const tagName = activeEl.tagName?.toUpperCase();
+    return (
+      tagName === "INPUT" ||
+      tagName === "TEXTAREA" ||
+      tagName === "SELECT" ||
+      activeEl.isContentEditable === true
+    );
+  }
+
+  private getRootEl(): HTMLElement {
+    return this.panelRootEl || this.contentEl;
   }
 
   private closeHost(): void {
@@ -228,120 +289,6 @@ export class WindowLayoutsModal extends Modal {
     const dismissInst = instructionsEl.createDiv("prompt-instruction");
     dismissInst.createSpan({ text: "esc", cls: "prompt-instruction-command" });
     dismissInst.createSpan({ text: t("instructions.dismiss") });
-
-    const targetDoc = contentEl.ownerDocument || document;
-    const targetWindow = targetDoc.defaultView || window;
-    this.removeKeydownListener();
-    this.keydownListener = (event: KeyboardEvent) => {
-      if (event.key !== "ArrowDown" && event.key !== "ArrowUp" && event.key !== "Enter") {
-        return;
-      }
-
-      const activeEl = targetDoc.activeElement as HTMLElement | null;
-      const ownRootEl = this.getRootEl();
-
-      // 當焦點位於 ownRootEl 之外的輸入框、編輯器或彈出對話框（如 Command Palette, Quick Switcher, Rename dialog 等）時，絕對不攔截按鍵
-      if (activeEl && !ownRootEl.contains(activeEl)) {
-        const tagName = activeEl.tagName?.toUpperCase();
-        if (
-          tagName === "INPUT" ||
-          tagName === "TEXTAREA" ||
-          tagName === "SELECT" ||
-          activeEl.isContentEditable ||
-          activeEl.classList?.contains("cm-content") ||
-          Boolean(activeEl.closest(".modal-container, .modal, .prompt, .prompt-container, .menu"))
-        ) {
-          return;
-        }
-      }
-
-      let focusedInstance: WindowLayoutsModal | null = null;
-      for (const instance of WindowLayoutsModal.activeInstances) {
-        const root = instance.getRootEl();
-        if (activeEl && root && root.ownerDocument === targetDoc && root.contains(activeEl)) {
-          focusedInstance = instance;
-          break;
-        }
-      }
-
-      // A panel or popup must never answer keys while the user is actually
-      // typing in a DIFFERENT window (a popout). Obsidian forwards key events
-      // between windows so core shortcuts keep working, so check the event's
-      // origin window, the event target's document, and whether THIS document
-      // currently holds OS focus. A forwarded event either keeps its original
-      // window/document (caught by the first two checks) or is rebuilt in the
-      // focused window (caught by document.hasFocus()).
-      const eventView = (event as KeyboardEvent & { view?: Window | null }).view;
-      const eventFromThisWindow = eventView == null || eventView === targetWindow;
-      const eventTargetDoc = (event.target as Element | null)?.ownerDocument ?? null;
-      const eventTargetsThisDocument = eventTargetDoc == null || eventTargetDoc === targetDoc;
-      const thisDocumentFocused = targetDoc.hasFocus();
-
-      // 檢查畫面中是否有 Command Palette (.prompt), Quick Switcher, Menu 或 Stacked Modals
-      const ownModalContainer = this.getOwnModalContainer();
-      const overlays = Array.from(
-        targetDoc.querySelectorAll<HTMLElement>(
-          ".modal-container, .modal, .prompt, .prompt-container, .menu"
-        )
-      );
-      const otherModalOpen = overlays.some((el) => {
-        if (ownModalContainer && (el === ownModalContainer || ownModalContainer.contains(el))) {
-          return false;
-        }
-        if (ownRootEl.contains(el)) {
-          return false;
-        }
-        const style = targetDoc.defaultView?.getComputedStyle(el);
-        return (
-          !el.classList.contains("is-hidden") &&
-          style?.display !== "none" &&
-          style?.visibility !== "hidden"
-        );
-      });
-
-      const menuOpen = Boolean(
-        targetDoc.querySelector<HTMLElement>(".menu:not(.is-hidden)")
-      );
-      const anyPopupOpen = Array.from(WindowLayoutsModal.activeInstances).some(
-        (instance) => !instance.panelMode
-      );
-      const shouldHandle =
-        eventFromThisWindow &&
-        eventTargetsThisDocument &&
-        thisDocumentFocused &&
-        (this.panelMode
-          ? !otherModalOpen &&
-            !menuOpen &&
-            (focusedInstance === this ||
-              (!anyPopupOpen && this.isPanelActive?.() === true))
-          : !otherModalOpen && !menuOpen);
-      if (!shouldHandle) return;
-
-      if (event.key === "ArrowDown" || event.key === "ArrowUp") {
-        event.preventDefault();
-        event.stopImmediatePropagation();
-        this.handleArrowKey(event.key === "ArrowDown" ? 1 : -1);
-        return;
-      }
-
-      if (activeEl && activeEl.tagName === "BUTTON") return;
-      event.preventDefault();
-      event.stopImmediatePropagation();
-      const rawQuery = this.searchInput?.value.trim() || "";
-      // 高亮（方向鍵）是以 renderedLayoutEntries 的渲染順序移動；分組檢視下
-      // 該順序與 filteredLayouts（排序順序）不同，必須以渲染順序取選中的 layout。
-      const entry = this.renderedLayoutEntries[this.selectedIndex >= 0 ? this.selectedIndex : 0];
-      const selectedLayout = entry ? entry.layout : this.filteredLayouts[0];
-      if (selectedLayout) {
-        void this.restoreLayout(selectedLayout, !event.shiftKey);
-      } else if (rawQuery) {
-        void this.createAndSaveLayout(rawQuery, !event.shiftKey);
-      }
-    };
-    // Listen on Window capture so Obsidian's document/workspace keymap cannot
-    // consume ArrowUp/ArrowDown before an active Window Spaces panel sees it.
-    this.keydownTarget = targetWindow;
-    this.keydownTarget.addEventListener("keydown", this.keydownListener, true);
 
     if (this.initialFocusTimer !== undefined) {
       const timerWindow = this.modalEl?.ownerDocument?.defaultView || window;
@@ -1382,7 +1329,7 @@ export class WindowLayoutsModal extends Modal {
 
   onClose() {
     WindowLayoutsModal.activeInstances.delete(this);
-    this.removeKeydownListener();
+    this.unbindScope();
 
     if (this.initialFocusTimer !== undefined) {
       const timerWindow = this.modalEl?.ownerDocument?.defaultView || window;
@@ -1392,17 +1339,5 @@ export class WindowLayoutsModal extends Modal {
 
     this.contentEl.empty();
   }
-
-  private removeKeydownListener(): void {
-    if (this.keydownListener) {
-      const target = this.keydownTarget || this.panelRootEl?.ownerDocument || this.modalEl?.ownerDocument || document;
-      target.removeEventListener("keydown", this.keydownListener as EventListener, true);
-      target.removeEventListener("keydown", this.keydownListener as EventListener, false);
-      this.keydownListener = undefined;
-      this.keydownTarget = undefined;
-    }
-  }
-
-
 }
 

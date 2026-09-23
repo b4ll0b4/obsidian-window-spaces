@@ -395,6 +395,9 @@ export default class WindowSpacesPlugin extends Plugin {
             hostModal.contentEl,
             () => hostModal.close()
           );
+          // Popup picker 走 Stack scope：Modal.open 已把 hostModal.scope 推上該視窗的
+          // scope 堆疊頂端，因此它擁有按鍵、且其他 modal / menu / Quick Switcher 自動讓位。
+          controller.bindScope(hostModal.scope);
           const titleHeader = hostModal.containerEl.querySelector<HTMLElement>(".modal-title");
           if (titleHeader) {
             controller.mountHeaderActions(titleHeader);

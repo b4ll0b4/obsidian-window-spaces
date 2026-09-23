@@ -1,4 +1,5 @@
 import { beforeEach, describe, expect, test, vi } from "vitest";
+import { Modal, Scope } from "obsidian";
 import { WindowLayoutsModal } from "../src/modals/restoreModal";
 import WindowSpacesPlugin from "../src/main";
 import { WindowLayout } from "../src/types";
@@ -14,6 +15,57 @@ beforeEach(() => {
   vi.restoreAllMocks();
   vi.spyOn(document, "hasFocus").mockReturnValue(true);
 });
+
+/**
+ * 產生帶有 Obsidian Element helper 的真實 DOM 元素（沿用本檔既有的 mock 模式）。
+ */
+function createDomEl(tag = "div"): any {
+  const el = document.createElement(tag) as any;
+  el.empty = () => {
+    el.innerHTML = "";
+  };
+  el.addClass = (c: any) => {
+    if (typeof c !== "string") return;
+    c.split(/\s+/)
+      .filter(Boolean)
+      .forEach((cls: string) => el.classList.add(cls));
+  };
+  el.createDiv = (cls?: string) => {
+    const child = createDomEl("div");
+    if (cls) child.addClass(cls);
+    el.appendChild(child);
+    return child;
+  };
+  el.createEl = (t: string, opts?: any) => {
+    const child = createDomEl(t);
+    if (typeof opts === "string") child.addClass(opts);
+    else if (opts?.cls) child.addClass(opts.cls);
+    if (opts?.text !== undefined) child.textContent = opts.text;
+    el.appendChild(child);
+    return child;
+  };
+  el.createSpan = (opts?: any) => el.createEl("span", opts);
+  if (tag === "input") el.value = "";
+  return el;
+}
+
+/**
+ * 模擬 Obsidian keymap 對 scope 的派送：先派送真實 DOM 事件（讓 event.target 與
+ * DOM 行為一致），再呼叫 Scope.handleKey；回傳 false 時 Obsidian 會 preventDefault。
+ */
+function pressKey(
+  scope: Scope,
+  key: string,
+  target: EventTarget,
+  init: KeyboardEventInit = {}
+): { event: KeyboardEvent; consumed: boolean; result: unknown } {
+  const event = new KeyboardEvent("keydown", { key, bubbles: true, cancelable: true, ...init });
+  target.dispatchEvent(event);
+  const result = scope.handleKey(event, { modifiers: "", key, vkey: key });
+  const consumed = result === false;
+  if (consumed) event.preventDefault();
+  return { event, consumed, result };
+}
 
 describe("WindowLayoutsModal restore target", () => {
   test("keeps the source popout window when restoring in a new window", async () => {
@@ -168,7 +220,27 @@ describe("WindowLayoutsModal restore target", () => {
     expect(titleEl.querySelectorAll(".window-layouts-header-actions")).toHaveLength(1);
   });
 
-  test("an open popup modal owns arrow navigation while background panels yield", () => {
+  // ---------------------------------------------------------------------------
+  // Scope 路線：Obsidian 以 activeLeaf（View scope）或 scope 堆疊（Modal scope）
+  // 決定把按鍵交給誰。Window Spaces 只負責在 scope 被呼叫時處理，因此不再需要
+  // activeElement / overlay / menu / hasFocus / active leaf 等啟發式條件。
+  // ---------------------------------------------------------------------------
+
+  test("mountInContainer 不註冊任何 window keydown listener", () => {
+    WindowLayoutsModal.activeInstances.clear();
+    const plugin = { manager: { getSavedLayouts: () => [], getSavedViewStates: () => [] } };
+    const addListener = vi.spyOn(window, "addEventListener");
+    const modal = new WindowLayoutsModal({} as any, plugin);
+
+    modal.mountInContainer(createDomEl("div"));
+
+    const keydownCalls = addListener.mock.calls.filter(([type]) => type === "keydown");
+    expect(keydownCalls).toHaveLength(0);
+    modal.unmountFromContainer();
+    addListener.mockRestore();
+  });
+
+  test("綁定 Scope 後 ArrowUp / ArrowDown 會吃掉按鍵並移動選取", () => {
     WindowLayoutsModal.activeInstances.clear();
     const plugin = {
       manager: {
@@ -176,482 +248,149 @@ describe("WindowLayoutsModal restore target", () => {
         getSavedViewStates: () => [],
       },
     };
+    const modal = new WindowLayoutsModal({} as any, plugin);
+    modal.mountInContainer(createDomEl("div"));
+    const scope = new Scope();
+    modal.bindScope(scope);
 
-    const createMockEl = (tag = "div") => {
-      const el = document.createElement(tag) as any;
-      el.empty = () => { el.innerHTML = ""; };
-      el.addClass = () => {};
-      el.createDiv = () => createMockEl("div");
-      el.createEl = (t: string) => createMockEl(t);
-      el.createSpan = () => createMockEl("span");
-      el.setAttribute = () => {};
-      return el;
+    expect(scope.registeredKeys().sort()).toEqual(["ArrowDown", "ArrowUp", "Enter", "Shift+Enter"]);
+
+    const down = pressKey(scope, "ArrowDown", document.body);
+    expect(down.consumed).toBe(true);
+    expect((modal as any).selectedIndex).toBe(1);
+
+    const up = pressKey(scope, "ArrowUp", document.body);
+    expect(up.consumed).toBe(true);
+    expect((modal as any).selectedIndex).toBe(0);
+
+    modal.unbindScope();
+    expect(scope.registeredKeys()).toHaveLength(0);
+    modal.unmountFromContainer();
+  });
+
+  test("panel 取得 mouse focus（activeElement 在 panel 外）時方向鍵仍可操作", () => {
+    // 實測情境（CDP）：點擊 panel 空白處後 document.activeElement 會變成 body，
+    // 但 Obsidian 已把 panel 的 leaf 設為 activeLeaf → keymap 仍會查詢 view.scope。
+    WindowLayoutsModal.activeInstances.clear();
+    const plugin = {
+      manager: {
+        getSavedLayouts: () => [{ id: "1", name: "A" }, { id: "2", name: "B" }],
+        getSavedViewStates: () => [],
+      },
     };
+    const modal = new WindowLayoutsModal({} as any, plugin);
+    modal.mountInContainer(createDomEl("div"));
+    const scope = new Scope();
+    modal.bindScope(scope);
 
-    // Background panel whose leaf reports active while the popup overlays it.
+    expect(document.activeElement).toBe(document.body);
+
+    const down = pressKey(scope, "ArrowDown", document.body);
+    expect(down.consumed).toBe(true);
+    expect((modal as any).selectedIndex).toBe(1);
+
+    modal.unmountFromContainer();
+  });
+
+  test("每個 instance 只在自己被呼叫的 scope 上反應（由 Obsidian 決定最上層）", () => {
+    WindowLayoutsModal.activeInstances.clear();
+    const plugin = {
+      manager: {
+        getSavedLayouts: () => [{ id: "1", name: "A" }, { id: "2", name: "B" }],
+        getSavedViewStates: () => [],
+      },
+    };
     const panel = new WindowLayoutsModal({} as any, plugin);
-    const panelRoot = createMockEl();
-    panel.mountInContainer(panelRoot);
-    (panel as any).isPanelActive = () => true;
-    (panel as any).handleArrowKey(1);
-
-    // Popup modal host, mounted before the panel in registration order would
-    // have made the panel swallow the keys (capture phase).
+    panel.mountInContainer(createDomEl("div"));
     const popup = new WindowLayoutsModal({} as any, plugin);
-    const popupRoot = createMockEl();
-    popup.mountInModalContainer(popupRoot, () => {});
-    document.body.appendChild(popupRoot);
-    const input = document.createElement("input");
-    popupRoot.appendChild(input);
-    input.focus();
-    expect(document.activeElement).toBe(input);
+    popup.mountInModalContainer(createDomEl("div"), () => {});
 
-    // Focus inside the popup: only the popup may handle the arrow.
-    const focusedArrow = new KeyboardEvent("keydown", {
-      key: "ArrowDown",
-      bubbles: true,
-      cancelable: true,
-    });
-    window.dispatchEvent(focusedArrow);
+    const panelScope = new Scope();
+    const popupScope = new Scope();
+    panel.bindScope(panelScope);
+    popup.bindScope(popupScope);
 
+    // popup（Modal scope）在最上層時只由 popup 處理，背景 panel 不受影響。
+    pressKey(popupScope, "ArrowDown", document.body);
     expect((popup as any).selectedIndex).toBe(1);
-    expect((panel as any).selectedIndex).toBe(1);
-    expect(focusedArrow.defaultPrevented).toBe(true);
+    expect((panel as any).selectedIndex).toBe(0);
 
-    // Focus outside every instance: the open popup still owns the arrow.
-    input.blur();
-    const blurredArrow = new KeyboardEvent("keydown", {
-      key: "ArrowDown",
-      bubbles: true,
-      cancelable: true,
-    });
-    window.dispatchEvent(blurredArrow);
-
-    expect((popup as any).selectedIndex).toBe(0);
+    // popup 關閉後由 panel 接手（模擬 Obsidian popScope 後換 panel scope 被查詢）。
+    pressKey(panelScope, "ArrowDown", document.body);
     expect((panel as any).selectedIndex).toBe(1);
-    expect(blurredArrow.defaultPrevented).toBe(true);
+    expect((popup as any).selectedIndex).toBe(1);
 
     panel.unmountFromContainer();
     popup.unmountFromContainer();
-    document.body.removeChild(popupRoot);
   });
 
-  test("maintains independent selected index and focus navigation across active panel instances", () => {
+  test("unmountFromContainer 會解除 scope 綁定（popup modal 關閉路徑）", () => {
     WindowLayoutsModal.activeInstances.clear();
-    const plugin = {
-      manager: {
-        getSavedLayouts: () => [{ id: "1", name: "A" }, { id: "2", name: "B" }],
-        getSavedViewStates: () => [],
-      },
-    };
-    const modal1 = new WindowLayoutsModal({} as any, plugin);
-    const modal2 = new WindowLayoutsModal({} as any, plugin);
-
-    const createMockEl = (tag = "div") => {
-      const el = document.createElement(tag) as any;
-      el.empty = () => { el.innerHTML = ""; };
-      el.addClass = () => {};
-      el.createDiv = () => createMockEl("div");
-      el.createEl = (t: string) => createMockEl(t);
-      el.createSpan = () => createMockEl("span");
-      el.setAttribute = () => {};
-      if (tag === "input") el.value = "";
-      return el;
-    };
-    const div1 = createMockEl();
-    const div2 = createMockEl();
-
-    modal1.mountInContainer(div1);
-    modal2.mountInContainer(div2);
-
-    (modal1 as any).handleArrowKey(1);
-
-    expect((modal1 as any).selectedIndex).toBe(1);
-    expect((modal2 as any).selectedIndex).toBe(0);
-
-    // Hovering without clicking must NOT steal arrow keys: a panel only owns
-    // navigation when it is the active leaf or contains the focus.
-    div1.dispatchEvent(new Event("pointerenter"));
-    const hoverArrowEvent = new KeyboardEvent("keydown", {
-      key: "ArrowDown",
-      bubbles: true,
-      cancelable: true,
+    const popup = new WindowLayoutsModal({} as any, {
+      manager: { getSavedLayouts: () => [], getSavedViewStates: () => [] },
     });
-    window.dispatchEvent(hoverArrowEvent);
+    popup.mountInModalContainer(createDomEl("div"), () => {});
+    const scope = new Scope();
+    popup.bindScope(scope);
+    expect(scope.registeredKeys()).toHaveLength(4);
 
-    expect((modal1 as any).selectedIndex).toBe(1);
-    expect((modal2 as any).selectedIndex).toBe(0);
-    expect(hoverArrowEvent.defaultPrevented).toBe(false);
-
-    // When the panel is the active leaf, Window capture delivers navigation.
-    (modal1 as any).isPanelActive = () => true;
-    const activeArrowEvent = new KeyboardEvent("keydown", {
-      key: "ArrowDown",
-      bubbles: true,
-      cancelable: true,
-    });
-    window.dispatchEvent(activeArrowEvent);
-
-    expect((modal1 as any).selectedIndex).toBe(0);
-    expect((modal2 as any).selectedIndex).toBe(0);
-    expect(activeArrowEvent.defaultPrevented).toBe(true);
-
-    // Test new panel initial independence
-    const div3 = createMockEl();
-    const modal3 = new WindowLayoutsModal({} as any, plugin);
-    modal3.mountInContainer(div3);
-
-    expect((modal3 as any).selectedIndex).toBe(0);
-
-    modal1.unmountFromContainer();
-    modal2.unmountFromContainer();
-    modal3.unmountFromContainer();
-  });
-
-  test("triggers createAndSaveLayout when Enter is pressed and no layout matches query", async () => {
-    const saveLayout = vi.fn().mockResolvedValue(undefined);
-    const captureCurrentLayout = vi.fn().mockResolvedValue({ id: "new-id", name: "" });
-    const fakeWin = { document: { body: { classList: { contains: () => true } } } } as any;
-    const plugin = {
-      manager: {
-        getSavedLayouts: () => [],
-        saveLayout,
-        captureCurrentLayout,
-      },
-    };
-    const modal = new WindowLayoutsModal({ workspace: { iterateAllLeaves: vi.fn() } } as any, plugin, fakeWin);
-    (modal as any).searchInput = { value: "New Workspace" };
-
-    await (modal as any).createAndSaveLayout("New Workspace");
-
-    expect(captureCurrentLayout).toHaveBeenCalled();
-    expect(saveLayout).toHaveBeenCalledWith(expect.objectContaining({ name: "New Workspace" }));
-  });
-  test("panel yields arrow navigation while a native modal (Quick Switcher / Command Palette) is open", () => {
-    WindowLayoutsModal.activeInstances.clear();
-    const plugin = {
-      manager: {
-        getSavedLayouts: () => [{ id: "1", name: "A" }, { id: "2", name: "B" }],
-        getSavedViewStates: () => [],
-      },
-    };
-
-    const createMockEl = (tag = "div") => {
-      const el = document.createElement(tag) as any;
-      el.empty = () => { el.innerHTML = ""; };
-      el.addClass = () => {};
-      el.createDiv = () => createMockEl("div");
-      el.createEl = (t: string) => createMockEl(t);
-      el.createSpan = () => createMockEl("span");
-      el.setAttribute = () => {};
-      return el;
-    };
-
-    const panel = new WindowLayoutsModal({} as any, plugin);
-    const panelRoot = createMockEl();
-    panel.mountInContainer(panelRoot);
-    (panel as any).isPanelActive = () => true;
-    expect((panel as any).selectedIndex).toBe(0);
-
-    // Simulate Quick Switcher / Command Palette: a native .modal-container
-    // overlay is present in the same window.
-    const modalContainer = document.createElement("div");
-    modalContainer.className = "modal-container";
-    document.body.appendChild(modalContainer);
-    const modalInput = document.createElement("input");
-    modalContainer.appendChild(modalInput);
-    modalInput.focus();
-
-    const arrowWhileModal = new KeyboardEvent("keydown", {
-      key: "ArrowDown",
-      bubbles: true,
-      cancelable: true,
-    });
-    window.dispatchEvent(arrowWhileModal);
-
-    // The panel must NOT consume the arrow while the modal is open.
-    expect(arrowWhileModal.defaultPrevented).toBe(false);
-    expect((panel as any).selectedIndex).toBe(0);
-
-    // Enter while the modal is open must also pass through untouched.
-    const enterWhileModal = new KeyboardEvent("keydown", {
-      key: "Enter",
-      bubbles: true,
-      cancelable: true,
-    });
-    window.dispatchEvent(enterWhileModal);
-    expect(enterWhileModal.defaultPrevented).toBe(false);
-
-    // Closing the modal restores the panel's ownership of arrow keys.
-    document.body.removeChild(modalContainer);
-    const arrowAfterModal = new KeyboardEvent("keydown", {
-      key: "ArrowDown",
-      bubbles: true,
-      cancelable: true,
-    });
-    window.dispatchEvent(arrowAfterModal);
-    expect(arrowAfterModal.defaultPrevented).toBe(true);
-    expect((panel as any).selectedIndex).toBe(1);
-
-    panel.unmountFromContainer();
-  });
-
-  test("panel yields arrow navigation while a dropdown menu is open", () => {
-    WindowLayoutsModal.activeInstances.clear();
-    const plugin = {
-      manager: {
-        getSavedLayouts: () => [{ id: "1", name: "A" }, { id: "2", name: "B" }],
-        getSavedViewStates: () => [],
-      },
-    };
-
-    const createMockEl = (tag = "div") => {
-      const el = document.createElement(tag) as any;
-      el.empty = () => { el.innerHTML = ""; };
-      el.addClass = () => {};
-      el.createDiv = () => createMockEl("div");
-      el.createEl = (t: string) => createMockEl(t);
-      el.createSpan = () => createMockEl("span");
-      el.setAttribute = () => {};
-      return el;
-    };
-
-    const panel = new WindowLayoutsModal({} as any, plugin);
-    const panelRoot = createMockEl();
-    panel.mountInContainer(panelRoot);
-    (panel as any).isPanelActive = () => true;
-    expect((panel as any).selectedIndex).toBe(0);
-
-    const menu = document.createElement("div");
-    menu.className = "menu";
-    document.body.appendChild(menu);
-
-    const arrowWhileMenu = new KeyboardEvent("keydown", {
-      key: "ArrowDown",
-      bubbles: true,
-      cancelable: true,
-    });
-    window.dispatchEvent(arrowWhileMenu);
-    expect(arrowWhileMenu.defaultPrevented).toBe(false);
-    expect((panel as any).selectedIndex).toBe(0);
-
-    // A hidden menu (closing animation) must not keep the panel disabled.
-    menu.classList.add("is-hidden");
-    const arrowAfterMenuHidden = new KeyboardEvent("keydown", {
-      key: "ArrowDown",
-      bubbles: true,
-      cancelable: true,
-    });
-    window.dispatchEvent(arrowAfterMenuHidden);
-    expect(arrowAfterMenuHidden.defaultPrevented).toBe(true);
-    expect((panel as any).selectedIndex).toBe(1);
-
-    document.body.removeChild(menu);
-    panel.unmountFromContainer();
-  });
-
-  test("popup picker yields when a different native modal is stacked above it", () => {
-    WindowLayoutsModal.activeInstances.clear();
-    const plugin = {
-      manager: {
-        getSavedLayouts: () => [{ id: "1", name: "A" }, { id: "2", name: "B" }],
-        getSavedViewStates: () => [],
-      },
-    };
-
-    const createMockEl = (tag = "div") => {
-      const el = document.createElement(tag) as any;
-      el.empty = () => { el.innerHTML = ""; };
-      el.addClass = () => {};
-      el.createDiv = () => createMockEl("div");
-      el.createEl = (t: string) => createMockEl(t);
-      el.createSpan = () => createMockEl("span");
-      el.setAttribute = () => {};
-      return el;
-    };
-
-    // Host modal container that Obsidian's native Modal creates.
-    const hostContainer = document.createElement("div");
-    hostContainer.className = "modal-container";
-    document.body.appendChild(hostContainer);
-    const hostContent = createMockEl();
-    hostContainer.appendChild(hostContent);
-
-    const popup = new WindowLayoutsModal({} as any, plugin);
-    popup.mountInModalContainer(hostContent, () => {});
-    const popupInput = document.createElement("input");
-    hostContent.appendChild(popupInput);
-    popupInput.focus();
-
-    // Only the picker's own modal is open: it owns the arrow keys.
-    const ownArrow = new KeyboardEvent("keydown", {
-      key: "ArrowDown",
-      bubbles: true,
-      cancelable: true,
-    });
-    window.dispatchEvent(ownArrow);
-    expect(ownArrow.defaultPrevented).toBe(true);
-    expect((popup as any).selectedIndex).toBe(1);
-
-    // Another modal (rename dialog, Command Palette, ...) is stacked above
-    // the picker: the picker must yield.
-    const otherContainer = document.createElement("div");
-    otherContainer.className = "modal-container";
-    document.body.appendChild(otherContainer);
-    const otherInput = document.createElement("input");
-    otherContainer.appendChild(otherInput);
-    otherInput.focus();
-
-    const stackedArrow = new KeyboardEvent("keydown", {
-      key: "ArrowDown",
-      bubbles: true,
-      cancelable: true,
-    });
-    window.dispatchEvent(stackedArrow);
-    expect(stackedArrow.defaultPrevented).toBe(false);
-    expect((popup as any).selectedIndex).toBe(1);
-
-    document.body.removeChild(otherContainer);
-    document.body.removeChild(hostContainer);
     popup.unmountFromContainer();
+
+    expect(scope.registeredKeys()).toHaveLength(0);
   });
-  test("panel yields to key events forwarded from another window (popout)", () => {
+
+  test("bindScope 會取代先前的綁定（避免重複處理同一個鍵）", () => {
     WindowLayoutsModal.activeInstances.clear();
-    const plugin = {
+    const modal = new WindowLayoutsModal({} as any, {
       manager: {
         getSavedLayouts: () => [{ id: "1", name: "A" }, { id: "2", name: "B" }],
         getSavedViewStates: () => [],
       },
-    };
-
-    const createMockEl = (tag = "div") => {
-      const el = document.createElement(tag) as any;
-      el.empty = () => { el.innerHTML = ""; };
-      el.addClass = () => {};
-      el.createDiv = () => createMockEl("div");
-      el.createEl = (t: string) => createMockEl(t);
-      el.createSpan = () => createMockEl("span");
-      el.setAttribute = () => {};
-      return el;
-    };
-
-    const panel = new WindowLayoutsModal({} as any, plugin);
-    const panelRoot = createMockEl();
-    panel.mountInContainer(panelRoot);
-    (panel as any).isPanelActive = () => true;
-    expect((panel as any).selectedIndex).toBe(0);
-
-    // A real key in THIS window: the panel owns navigation.
-    const normalArrow = new KeyboardEvent("keydown", {
-      key: "ArrowDown",
-      bubbles: true,
-      cancelable: true,
     });
-    window.dispatchEvent(normalArrow);
-    expect(normalArrow.defaultPrevented).toBe(true);
-    expect((panel as any).selectedIndex).toBe(1);
+    modal.mountInContainer(createDomEl("div"));
 
-    // Obsidian forwards the ORIGINAL event object from the popout window:
-    // event.view is the popout window and event.target lives in the popout
-    // document. The main-window panel must yield.
-    const otherDoc = { nodeType: 9 } as any;
-    const otherTarget = { ownerDocument: otherDoc } as any;
-    const forwardedArrow = new KeyboardEvent("keydown", {
-      key: "ArrowDown",
-      bubbles: true,
-      cancelable: true,
-    });
-    Object.defineProperty(forwardedArrow, "view", { value: { isPopout: true } });
-    Object.defineProperty(forwardedArrow, "target", { value: otherTarget });
-    window.dispatchEvent(forwardedArrow);
-    expect(forwardedArrow.defaultPrevented).toBe(false);
-    expect((panel as any).selectedIndex).toBe(1);
+    const first = new Scope();
+    const second = new Scope();
+    modal.bindScope(first);
+    modal.bindScope(second);
 
-    // Obsidian rebuilt the event in this window (view/target look local) but
-    // the popout still holds OS focus: document.hasFocus() is false.
-    vi.mocked(document.hasFocus).mockReturnValue(false);
-    const blurredArrow = new KeyboardEvent("keydown", {
-      key: "ArrowDown",
-      bubbles: true,
-      cancelable: true,
-    });
-    window.dispatchEvent(blurredArrow);
-    expect(blurredArrow.defaultPrevented).toBe(false);
-    expect((panel as any).selectedIndex).toBe(1);
+    expect(first.registeredKeys()).toHaveLength(0);
+    expect(second.registeredKeys()).toHaveLength(4);
 
-    // Focus returns to this window: navigation resumes.
-    vi.mocked(document.hasFocus).mockReturnValue(true);
-    const refocusedArrow = new KeyboardEvent("keydown", {
-      key: "ArrowDown",
-      bubbles: true,
-      cancelable: true,
-    });
-    window.dispatchEvent(refocusedArrow);
-    expect(refocusedArrow.defaultPrevented).toBe(true);
-    expect((panel as any).selectedIndex).toBe(0);
+    pressKey(second, "ArrowDown", document.body);
+    expect((modal as any).selectedIndex).toBe(1);
 
-    panel.unmountFromContainer();
+    modal.unmountFromContainer();
   });
 
-  test("popup picker yields when a different window holds the keyboard focus", () => {
+  test("openWindowLayoutsModal 把 popup picker 綁定到 host modal 的 scope", () => {
     WindowLayoutsModal.activeInstances.clear();
-    const plugin = {
-      manager: {
-        getSavedLayouts: () => [{ id: "1", name: "A" }, { id: "2", name: "B" }],
-        getSavedViewStates: () => [],
-      },
-    };
+    const before = Modal.instances.length;
+    const plugin = new WindowSpacesPlugin({} as any, {} as any);
+    plugin.manager = {
+      getActiveWindow: () => undefined,
+      getSavedLayouts: () => [],
+      getSavedViewStates: () => [],
+    } as any;
 
-    const createMockEl = (tag = "div") => {
-      const el = document.createElement(tag) as any;
-      el.empty = () => { el.innerHTML = ""; };
-      el.addClass = () => {};
-      el.createDiv = () => createMockEl("div");
-      el.createEl = (t: string) => createMockEl(t);
-      el.createSpan = () => createMockEl("span");
-      el.setAttribute = () => {};
-      return el;
-    };
+    plugin.openWindowLayoutsModal();
 
-    const hostContainer = document.createElement("div");
-    hostContainer.className = "modal-container";
-    document.body.appendChild(hostContainer);
-    const hostContent = createMockEl();
-    hostContainer.appendChild(hostContent);
+    const hostModal = Modal.instances
+      .slice(before)
+      .find((instance) => typeof instance.onOpen === "function");
+    expect(hostModal).toBeDefined();
 
-    const popup = new WindowLayoutsModal({} as any, plugin);
-    popup.mountInModalContainer(hostContent, () => {});
-    const input = document.createElement("input");
-    hostContent.appendChild(input);
-    input.focus();
+    hostModal.onOpen?.();
+    expect(hostModal.scope.registeredKeys().sort()).toEqual([
+      "ArrowDown",
+      "ArrowUp",
+      "Enter",
+      "Shift+Enter",
+    ]);
 
-    // The popup's own window is focused: it owns the arrow keys.
-    const ownArrow = new KeyboardEvent("keydown", {
-      key: "ArrowDown",
-      bubbles: true,
-      cancelable: true,
-    });
-    window.dispatchEvent(ownArrow);
-    expect(ownArrow.defaultPrevented).toBe(true);
-    expect((popup as any).selectedIndex).toBe(1);
-
-    // The user switches to a popout window: this document loses OS focus and
-    // the popup must not steal keys that belong to the popout.
-    vi.mocked(document.hasFocus).mockReturnValue(false);
-    const popoutArrow = new KeyboardEvent("keydown", {
-      key: "ArrowDown",
-      bubbles: true,
-      cancelable: true,
-    });
-    window.dispatchEvent(popoutArrow);
-    expect(popoutArrow.defaultPrevented).toBe(false);
-    expect((popup as any).selectedIndex).toBe(1);
-
-    vi.mocked(document.hasFocus).mockReturnValue(true);
-    document.body.removeChild(hostContainer);
-    popup.unmountFromContainer();
+    hostModal.onClose?.();
+    expect(hostModal.scope.registeredKeys()).toHaveLength(0);
   });
-
   test("openWindowLayoutsPanel detects popout window and creates simulated left sidebar", async () => {
     const popoutWin = {
       document: {
@@ -834,89 +573,89 @@ describe("WindowLayoutsModal restore target", () => {
     expect(columns[1].panes.length).toBe(1); // rightTabs in column 1
   });
 
-  test("panel ignores Enter keydown when Command Palette / prompt input outside panel is focused", () => {
+  test("panel 內的非搜尋框可編輯元素（inline section rename）不被攔截，Enter 交還 DOM", () => {
+    // 這是原本 DOM listener 路線漏掉的案例（CDP 實測：Enter 會被拿去做 restoreLayout，
+    // 導致 rename 無法 commit）。Scope 路線對 root 內「搜尋框以外」的可編輯元素一律放行。
+    WindowLayoutsModal.activeInstances.clear();
     const restoreLayout = vi.fn().mockResolvedValue(undefined);
     const plugin = {
-      manager: { getSavedLayouts: () => [{ id: "l1", name: "L1" }], getSavedViewStates: () => [], restoreLayout },
+      manager: { restoreLayout, getSavedLayouts: () => [{ id: "1", name: "A" }], getSavedViewStates: () => [] },
     };
     const modal = new WindowLayoutsModal({} as any, plugin);
+    const root = createDomEl("div");
+    document.body.appendChild(root);
+    modal.mountInContainer(root);
+    const scope = new Scope();
+    modal.bindScope(scope);
 
-    const createMockEl = (tag = "div") => {
-      const el = document.createElement(tag) as any;
-      el.empty = () => { el.innerHTML = ""; };
-      el.addClass = (c: any) => {
-        if (!c || typeof c !== "string") return;
-        c.split(/\s+/).filter(Boolean).forEach((cls) => el.classList.add(cls));
-      };
-      el.createDiv = (cls?: string) => {
-        const child = createMockEl("div");
-        if (cls) child.addClass(cls);
-        el.appendChild(child);
-        return child;
-      };
-      el.createEl = (t: string, opts?: any) => {
-        const child = createMockEl(t);
-        if (opts?.cls) child.addClass(opts.cls);
-        el.appendChild(child);
-        return child;
-      };
-      el.createSpan = () => createMockEl("span");
-      el.setAttribute = () => {};
-      el.style = {};
-      return el;
-    };
+    const renameInput = createDomEl("input");
+    renameInput.className = "space-section-rename-input";
+    root.appendChild(renameInput);
+    renameInput.focus();
 
-    const panelContainer = createMockEl();
-    document.body.appendChild(panelContainer);
-    modal.mountInContainer(panelContainer, false, () => true);
+    const enter = pressKey(scope, "Enter", renameInput);
 
-    const promptContainer = document.createElement("div");
-    promptContainer.className = "prompt";
-    const promptInput = document.createElement("input");
-    promptInput.className = "prompt-input";
-    promptContainer.appendChild(promptInput);
-    document.body.appendChild(promptContainer);
-    promptInput.focus();
-
-    const enterEvent = new KeyboardEvent("keydown", {
-      key: "Enter",
-      bubbles: true,
-      cancelable: true,
-    });
-
-    window.dispatchEvent(enterEvent);
-
-    expect(enterEvent.defaultPrevented).toBe(false);
+    expect(enter.consumed).toBe(false);
     expect(restoreLayout).not.toHaveBeenCalled();
 
     modal.unmountFromContainer();
-    document.body.removeChild(panelContainer);
-    document.body.removeChild(promptContainer);
+    document.body.removeChild(root);
   });
-});  test("分組檢視下 Enter 開啟高亮項（renderedLayoutEntries 渲染順序）而非 filteredLayouts 排序順序", () => {
+
+  test("IME 組字中的 Enter 放行（不攔截候選字確認）", () => {
+    WindowLayoutsModal.activeInstances.clear();
+    const restoreLayout = vi.fn().mockResolvedValue(undefined);
+    const modal = new WindowLayoutsModal({} as any, {
+      manager: { restoreLayout, getSavedLayouts: () => [{ id: "1", name: "A" }], getSavedViewStates: () => [] },
+    });
+    modal.mountInContainer(createDomEl("div"));
+    const scope = new Scope();
+    modal.bindScope(scope);
+
+    const composing = pressKey(scope, "Enter", document.body, { isComposing: true });
+
+    expect(composing.consumed).toBe(false);
+    expect(restoreLayout).not.toHaveBeenCalled();
+
+    modal.unmountFromContainer();
+  });
+
+  test("焦點在按鈕上時 Enter 放行（保留原生按鈕行為）", () => {
+    WindowLayoutsModal.activeInstances.clear();
+    const restoreLayout = vi.fn().mockResolvedValue(undefined);
+    const modal = new WindowLayoutsModal({} as any, {
+      manager: { restoreLayout, getSavedLayouts: () => [{ id: "1", name: "A" }], getSavedViewStates: () => [] },
+    });
+    const root = createDomEl("div");
+    document.body.appendChild(root);
+    modal.mountInContainer(root);
+    const scope = new Scope();
+    modal.bindScope(scope);
+
+    const button = createDomEl("button");
+    root.appendChild(button);
+    button.focus();
+
+    const enter = pressKey(scope, "Enter", button);
+
+    expect(enter.consumed).toBe(false);
+    expect(restoreLayout).not.toHaveBeenCalled();
+
+    modal.unmountFromContainer();
+    document.body.removeChild(root);
+  });
+
+  test("分組檢視下 Enter 開啟高亮項（renderedLayoutEntries 渲染順序）而非 filteredLayouts 排序順序", () => {
     WindowLayoutsModal.activeInstances.clear();
     const restoreLayout = vi.fn().mockResolvedValue(undefined);
     const plugin = {
       manager: { restoreLayout, getSavedLayouts: () => [], getSavedViewStates: () => [] },
     };
 
-    const createMockEl = (tag = "div") => {
-      const el = document.createElement(tag) as any;
-      el.empty = () => { el.innerHTML = ""; };
-      el.addClass = () => {};
-      el.createDiv = () => createMockEl("div");
-      el.createEl = (t: string) => createMockEl(t);
-      el.createSpan = () => createMockEl("span");
-      el.setAttribute = () => {};
-      if (tag === "input") el.value = "";
-      return el;
-    };
-
     const modal = new WindowLayoutsModal({} as any, plugin);
-    const root = createMockEl();
-    modal.mountInContainer(root);
-    (modal as any).panelMode = true;
-    (modal as any).isPanelActive = () => true;
+    modal.mountInContainer(createDomEl("div"));
+    const scope = new Scope();
+    modal.bindScope(scope);
 
     // 模擬分組檢視渲染後的狀態：renderedLayoutEntries（分組渲染順序）
     // 與 filteredLayouts（排序順序）不同。
@@ -925,24 +664,20 @@ describe("WindowLayoutsModal restore target", () => {
     const layoutC = { id: "c", name: "C" };
     (modal as any).filteredLayouts = [layoutA, layoutB, layoutC];
     (modal as any).renderedLayoutEntries = [
-      { layout: layoutB, element: createMockEl() },
-      { layout: layoutC, element: createMockEl() },
-      { layout: layoutA, element: createMockEl() },
+      { layout: layoutB, element: createDomEl("div") },
+      { layout: layoutC, element: createDomEl("div") },
+      { layout: layoutA, element: createDomEl("div") },
     ];
     // 方向鍵把高亮移到 renderedLayoutEntries[1] = layoutC
     (modal as any).selectedIndex = 1;
 
-    const enterEvent = new KeyboardEvent("keydown", {
-      key: "Enter",
-      bubbles: true,
-      cancelable: true,
-    });
-    window.dispatchEvent(enterEvent);
+    const enter = pressKey(scope, "Enter", document.body);
 
-    expect(enterEvent.defaultPrevented).toBe(true);
+    expect(enter.consumed).toBe(true);
     // 必須開啟高亮項 C，而非 filteredLayouts[1]（B）
     expect(restoreLayout).toHaveBeenCalledTimes(1);
     expect(restoreLayout).toHaveBeenCalledWith(layoutC, expect.anything());
 
     modal.unmountFromContainer();
   });
+});
