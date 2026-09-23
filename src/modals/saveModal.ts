@@ -567,6 +567,8 @@ export class SaveLayoutModal extends Modal {
 
     let selectEl!: HTMLSelectElement;
     const addRow = this.createSettingIn(activityGroup, (setting) => {
+      // 與外掛設定頁的「Add view」列一致：左側有 label，右側是下拉選單 + 按鈕。
+      setting.setName(t("settings.addView"));
       selectEl = setting.controlEl.createEl("select", { cls: "dropdown" });
     });
     addRow.addButton((button) => {

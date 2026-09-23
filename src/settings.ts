@@ -1,8 +1,6 @@
 import { App, PluginSettingTab, Setting, Notice, Modal, setIcon } from "obsidian";
-import type { SettingDefinitionItem } from "obsidian";
-import * as obsidian from "obsidian";
+import type { SettingDefinition, SettingDefinitionItem } from "obsidian";
 import { t } from "./i18n";
-import { SettingGroupLike } from "./types";
 import {
   ICON_CHOICES,
   applyItemIcon,
@@ -22,7 +20,6 @@ import {
 import WindowSpacesPlugin from "./main";
 import { DEFAULT_SPACE_ICON, isSpaceEmoji } from "./spaceVisuals";
 
-type SettingContainer = HTMLElement | SettingGroupLike;
 import type { ActivityBarItem } from "./types";
 
 function isActivityBarItem(value: ActivityBarItem | null | undefined): value is ActivityBarItem {
@@ -52,11 +49,6 @@ function setSettingPath(source: Record<string, unknown>, path: string, value: un
   }
   cursor[last] = value;
 }
-
-/** Obsidian `SettingGroup` 建構式（1.12.7+；舊版為 undefined）。 */
-const SettingGroupCtor = (obsidian as unknown as {
-  SettingGroup?: new (containerEl: HTMLElement) => SettingGroupLike;
-}).SettingGroup;
 
 /** 多欄 + 捲軸的 icon 選擇器 Modal。 */
 export class IconPickerModal extends Modal {
@@ -178,14 +170,14 @@ export class WindowSpacesSettingTab extends PluginSettingTab {
         ]
       },
       {
-        name: t("settings.leftBar"),
-        desc: t("settings.defaultActivityBarVisibilityDesc"),
-        render: (setting) => this.renderActivityBarDefinition(setting, "left")
+        type: "group",
+        heading: t("settings.leftBar"),
+        items: this.getActivityBarItems("left")
       },
       {
-        name: t("settings.rightBar"),
-        desc: t("settings.defaultActivityBarVisibilityDesc"),
-        render: (setting) => this.renderActivityBarDefinition(setting, "right")
+        type: "group",
+        heading: t("settings.rightBar"),
+        items: this.getActivityBarItems("right")
       },
       {
         name: t("settings.resetSettings"),
@@ -274,11 +266,6 @@ export class WindowSpacesSettingTab extends PluginSettingTab {
     updatePreview();
   }
 
-  private renderActivityBarDefinition(s: Setting, side: "left" | "right"): void {
-    s.controlEl.empty();
-    this.renderActivityBarSide(s.controlEl, side, side === "left" ? t("settings.leftBar") : t("settings.rightBar"));
-  }
-
   private renderResetSetting(s: Setting): void {
     s.addButton((button) => {
       button
@@ -310,140 +297,236 @@ export class WindowSpacesSettingTab extends PluginSettingTab {
     });
   }
 
-  /** 建立 SettingGroup（若當前 Obsidian 版本支援）；不支援則回傳 null。 */
-  private createGroup(containerEl: HTMLElement): SettingGroupLike | null {
-    if (SettingGroupCtor) {
-      try {
-        return new SettingGroupCtor(containerEl);
-      } catch {
-        return null;
-      }
-    }
-    return null;
-  }
-
-  /** 在 SettingGroup 或 HTMLElement 容器中建立並設定一個 Setting。 */
-  private createSettingIn(
-    container: SettingContainer,
-    configure: (setting: Setting) => void
-  ): Setting {
-    const group = container as SettingGroupLike;
-    if ("addSetting" in group && typeof group.addSetting === "function") {
-      let result: Setting | null = null;
-      group.addSetting((setting) => {
-        result = setting;
-        configure(setting);
-      });
-      if (result === null) throw new Error("SettingGroup.addSetting did not create a Setting");
-      return result;
-    }
-    const setting = new Setting(container as HTMLElement);
-    configure(setting);
-    return setting;
-  }
-
   private getDefaultBorderInset(): number {
     const value = this.plugin.settings.defaultBorderInset;
     return typeof value === "number" && Number.isFinite(value) ? Math.max(0, Math.min(5, value)) : 1;
   }
 
-  /** 渲染單一側欄 view 項目列，回傳用於 surgical 更新的 handle。 */
-  private renderSideItemRow(
-    container: SettingContainer,
-    side: "left" | "right",
-    item: ActivityBarItem,
-    index: number,
-    onChanged?: () => void
-  ): {
-    row: Setting;
-    updateIcon: (icon: string) => void;
-  } {
+  /**
+   * Activity Bar 區段的宣告式項目。
+   *
+   * 每一列都是一個 declarative setting（原生 `.setting-item`，滿寬兩欄），因此不會再出現
+   * 「把整段區塊塞進單列 `.setting-item-control`」而半寬擠壓、互相嵌套的破版（v1.2.5 起的問題）。
+   * 拖曳排序沿用原生 HTML5 drag events，由卡片上的 drop handler 統一處理。
+   */
+  private getActivityBarItems(side: "left" | "right"): SettingDefinition[] {
+    const stored = this.plugin.settings.activityBars?.[side];
+    const items = Array.isArray(stored) ? stored : [];
+    const validItems = items.filter(isActivityBarItem);
+
+    // Repair malformed entries left by an interrupted/old reorder instead of
+    // letting one bad item break the declarative list.
+    if (validItems.length !== items.length) {
+      this.plugin.settings.activityBars = this.plugin.settings.activityBars ?? { left: [], right: [] };
+      this.plugin.settings.activityBars[side] = validItems;
+      void this.plugin.saveSettings().catch((error: unknown) => {
+        console.warn("Failed to repair activity bar settings:", error);
+      });
+    }
+
+    const definitionItems: SettingDefinition[] = [
+      {
+        name: t("settings.importFromHost"),
+        desc: t("settings.importFromHostDesc"),
+        render: (setting) => this.renderActivityBarImport(setting, side),
+      },
+      {
+        name: t("settings.defaultActivityBarVisibility"),
+        desc: t("settings.defaultActivityBarVisibilityDesc"),
+        render: (setting) => this.renderActivityBarVisibility(setting, side),
+      },
+    ];
+
+    validItems.forEach((item) => {
+      definitionItems.push({
+        name: item.label || resolveViewLabel(this.app, item.viewType),
+        render: (setting) => this.renderActivityBarRow(setting, side, item),
+      });
+    });
+
+    definitionItems.push({
+      name: t("settings.addView"),
+      render: (setting) => this.renderActivityBarAddRow(setting, side),
+    });
+
+    return definitionItems;
+  }
+
+  /** 「從主側欄匯入」列。 */
+  private renderActivityBarImport(setting: Setting, side: "left" | "right"): void {
+    // Keep host adoption explicit. A live mirror would overwrite a Space's
+    // independent view selection whenever the main window changes.
+    setting.addButton((button) => {
+      button.setButtonText(t("settings.importFromHost")).onClick(async () => {
+        const imported = getViewsFromHostSplit(this.app, side);
+        if (imported.length === 0) {
+          new Notice(t("settings.importFromHostEmpty"));
+          return;
+        }
+
+        const previousActivityBars = this.plugin.settings.activityBars;
+        this.plugin.settings.activityBars = this.plugin.settings.activityBars ?? { left: [], right: [] };
+        this.plugin.settings.activityBars[side] = imported;
+        try {
+          await this.plugin.saveSettings();
+          this.plugin.activityBars.refreshAll();
+          this.update();
+          new Notice(t("settings.importFromHostSuccess"));
+        } catch (error: unknown) {
+          this.plugin.settings.activityBars = previousActivityBars;
+          console.warn("Failed to import Activity Bar views from host sidebar:", error);
+        }
+      });
+    });
+  }
+
+  /** 「預設顯示此 Activity Bar」列。 */
+  private renderActivityBarVisibility(setting: Setting, side: "left" | "right"): void {
+    setting.addToggle((toggle) => {
+      toggle.setValue(this.plugin.settings.activityBarDefaults?.[side] !== false);
+      toggle.onChange(async (value) => {
+        this.plugin.settings.activityBarDefaults = this.plugin.settings.activityBarDefaults ?? { left: true, right: true };
+        this.plugin.settings.activityBarDefaults[side] = value;
+        await this.plugin.saveSettings();
+        this.plugin.activityBars.refreshAll();
+      });
+    });
+  }
+
+  /** 單一 view 列：icon 選擇、還原預設 icon、移除，以及拖曳排序標記。 */
+  private renderActivityBarRow(setting: Setting, side: "left" | "right", item: ActivityBarItem): void {
     let iconBtn: { setIcon: (icon: string) => unknown } | null = null;
 
-    const row = this.createSettingIn(container, (s) => {
-      const resolvedLabel = resolveViewLabel(this.app, item.viewType);
-      s.setName(item.label || resolvedLabel);
-
-      s.addButton((button) => {
-        iconBtn = button;
-        // 動態套用 icon（見 saveModal）：避免同步 fallback("layout") 蓋過社群 view 的真實 icon。
-        applyItemIcon(button.buttonEl, this.app, item);
-        button.setTooltip(t("settings.pickIcon"));
-        button.onClick(() => {
-          const modal = new IconPickerModal(this.app, (iconName) => {
-            item.icon = iconName;
-            void this.plugin.saveSettings().then(() => {
-              this.plugin.activityBars.refreshAll();
-              iconBtn?.setIcon(iconName);
-            });
-          });
-          modal.open();
-        });
-      });
-
-      s.addButton((button) => {
-        button.setIcon("rotate-ccw").setTooltip(t("settings.restoreDefaultIcon"));
-        button.onClick(() => {
-          item.icon = undefined;
+    setting.addButton((button) => {
+      iconBtn = button;
+      // 動態套用 icon（見 saveModal）：避免同步 fallback("layout") 蓋過社群 view 的真實 icon。
+      applyItemIcon(button.buttonEl, this.app, item);
+      button.setTooltip(t("settings.pickIcon"));
+      button.onClick(() => {
+        const modal = new IconPickerModal(this.app, (iconName) => {
+          item.icon = iconName;
           void this.plugin.saveSettings().then(() => {
             this.plugin.activityBars.refreshAll();
-            iconBtn?.setIcon(resolveViewIcon(this.app, item.viewType));
-            void ensureViewIcon(this.app, item.viewType).then((icon) => {
-              if (!icon || item.icon) return;
-              iconBtn?.setIcon(icon);
-            });
+            iconBtn?.setIcon(iconName);
           });
         });
+        modal.open();
       });
+    });
 
-      s.addButton((button) => {
-         button.setButtonText(t("settings.removeView")).setDestructive().onClick(() => {
-          const current = this.plugin.settings.activityBars?.[side] ?? [];
-          if (!canRemoveActivityBarItem(current, enumerateAvailableViews(this.app)[side])) {
-            new Notice(t("settings.keepOneActivityBarView"));
-            return;
-          }
-          const idx = current.indexOf(item);
-          if (idx >= 0) {
-            current.splice(idx, 1);
-            this.plugin.settings.activityBars = this.plugin.settings.activityBars ?? { left: [], right: [] };
-            this.plugin.settings.activityBars[side] = current;
-          }
-          void this.plugin.saveSettings().then(() => {
-            this.plugin.activityBars.refreshAll();
-            row.settingEl.remove();
-            onChanged?.();
+    setting.addButton((button) => {
+      button.setIcon("rotate-ccw").setTooltip(t("settings.restoreDefaultIcon"));
+      button.onClick(() => {
+        item.icon = undefined;
+        void this.plugin.saveSettings().then(() => {
+          this.plugin.activityBars.refreshAll();
+          iconBtn?.setIcon(resolveViewIcon(this.app, item.viewType));
+          void ensureViewIcon(this.app, item.viewType).then((icon) => {
+            if (!icon || item.icon) return;
+            iconBtn?.setIcon(icon);
           });
         });
       });
     });
 
-    row.settingEl.setAttr("data-window-spaces-activity-item", side);
-    row.settingEl.setAttr("data-drag-index", String(index));
-    row.settingEl.setAttr("data-drag-view-type", item.viewType);
-    row.settingEl.setAttr("draggable", "true");
-
-    row.settingEl.addEventListener("dragstart", (e: DragEvent) => {
-      row.settingEl.classList.add("drag-source");
-      if (!e.dataTransfer) return;
-      e.dataTransfer.effectAllowed = "move";
-      e.dataTransfer.setData(ACTIVITY_BAR_DRAG_DATA_TYPE, item.viewType);
+    setting.addButton((button) => {
+      button.setButtonText(t("settings.removeView")).setDestructive().onClick(() => {
+        const current = this.plugin.settings.activityBars?.[side] ?? [];
+        if (!canRemoveActivityBarItem(current, enumerateAvailableViews(this.app)[side])) {
+          new Notice(t("settings.keepOneActivityBarView"));
+          return;
+        }
+        const idx = current.indexOf(item);
+        if (idx >= 0) current.splice(idx, 1);
+        this.plugin.settings.activityBars = this.plugin.settings.activityBars ?? { left: [], right: [] };
+        this.plugin.settings.activityBars[side] = current;
+        void this.plugin.saveSettings().then(() => {
+          this.plugin.activityBars.refreshAll();
+          this.update();
+        });
+      });
     });
 
-    row.settingEl.addEventListener("dragend", () => {
-      row.settingEl.classList.remove("drag-source");
+    setting.settingEl.setAttr("data-window-spaces-activity-item", side);
+    setting.settingEl.setAttr("data-drag-view-type", item.viewType);
+    setting.settingEl.setAttr("draggable", "true");
+
+    // 宣告式框架會重用同一列元素再跑一次 render（例如新增／移除／匯入後呼叫 update()），
+    // 但不會清掉我們自己插入的節點，因此這裡必須 idempotent：先移除舊的拖曳把手，
+    // 監聽器則用 flag 只掛一次（避免每次重繪都累加一個 grip）。
+    setting.settingEl.querySelectorAll(":scope > .window-spaces-activity-drag-handle").forEach((el) => {
+      el.remove();
     });
 
-    row.settingEl.querySelectorAll("button, input, select, .checkbox-container, .slider").forEach((el) => {
+    if (setting.settingEl.dataset.windowSpacesRowWired !== "1") {
+      setting.settingEl.dataset.windowSpacesRowWired = "1";
+
+      setting.settingEl.addEventListener("dragstart", (e: DragEvent) => {
+        // 事件時才讀取 viewType：列元素可能被重用給其他 view，closure 會過期。
+        const viewType = setting.settingEl.getAttribute("data-drag-view-type") ?? "";
+        setting.settingEl.classList.add("drag-source");
+        if (!e.dataTransfer || !viewType) return;
+        e.dataTransfer.effectAllowed = "move";
+        e.dataTransfer.setData(ACTIVITY_BAR_DRAG_DATA_TYPE, viewType);
+      });
+
+      setting.settingEl.addEventListener("dragend", () => {
+        setting.settingEl.classList.remove("drag-source");
+      });
+    }
+
+    setting.settingEl.querySelectorAll("button, input, select, .checkbox-container, .slider").forEach((el) => {
       el.setAttribute("draggable", "false");
     });
 
-    const gripEl = row.settingEl.createDiv({ cls: "window-spaces-activity-drag-handle" });
+    const gripEl = setting.settingEl.createDiv({ cls: "window-spaces-activity-drag-handle" });
     gripEl.setAttr("aria-label", t("settings.dragToReorder"));
     setIcon(gripEl, "grip-vertical");
-    row.settingEl.insertBefore(gripEl, row.settingEl.firstChild);
+    setting.settingEl.insertBefore(gripEl, setting.settingEl.firstChild);
 
-    return { row, updateIcon: (icon) => iconBtn?.setIcon(icon) };
+    const card = setting.settingEl.closest<HTMLElement>(".setting-items");
+    if (card) this.wireActivityBarDropTarget(card, side);
+  }
+
+  /** 「新增 view」列：下拉選單（排除已加入者）＋ Add view 按鈕。 */
+  private renderActivityBarAddRow(setting: Setting, side: "left" | "right"): void {
+    const selectEl = setting.controlEl.createEl("select", { cls: "dropdown" });
+    this.rebuildViewSelect(selectEl, side);
+
+    setting.addButton((button) => {
+      button.setButtonText(t("settings.addView")).onClick(() => {
+        const viewType = selectEl.value.trim();
+        if (!viewType) return;
+
+        const current = this.plugin.settings.activityBars?.[side] ?? [];
+        if (current.some((item: ActivityBarItem) => item.viewType === viewType)) return;
+
+        const newItem: ActivityBarItem = {
+          viewType,
+          side,
+          label: undefined,
+          // 見 saveModal.Add：不把 resolveViewIcon 的 fallback（"layout"）寫死——
+          // 社群 view（notebook-navigator 等）的實 icon 需動態偵測，寫死會蓋過
+          // 正確 icon；一律以動態（applyItemIcon）+ ensureViewIcon 補正。
+          icon: undefined,
+        };
+        current.push(newItem);
+        this.plugin.settings.activityBars = this.plugin.settings.activityBars ?? { left: [], right: [] };
+        this.plugin.settings.activityBars[side] = current;
+        void this.plugin.saveSettings().then(() => {
+          this.plugin.activityBars.refreshAll();
+          this.update();
+
+          void ensureViewIcon(this.app, viewType).then((icon) => {
+            if (!icon) return;
+            newItem.icon = icon;
+            this.plugin.activityBars.refreshAll();
+            void this.plugin.saveSettings();
+            this.update();
+          });
+        });
+      });
+    });
   }
 
   /** 重建「新增 view」下拉選單的選項（排除已加入的 view type）。 */
@@ -465,173 +548,24 @@ export class WindowSpacesSettingTab extends PluginSettingTab {
     });
   }
 
-  private renderActivityBarSide(section: HTMLElement, side: "left" | "right", heading: string): void {
-    new Setting(section).setName(heading).setHeading();
-    const group = this.createGroup(section) ?? section;
+  /** 在卡片上掛一次 drag & drop handler（列本身只帶 data-* 標記）。 */
+  private wireActivityBarDropTarget(card: HTMLElement, side: "left" | "right"): void {
+    if (card.dataset.windowSpacesDropWired === side) return;
+    card.dataset.windowSpacesDropWired = side;
 
-    // Keep host adoption explicit. A live mirror would overwrite a Space's
-    // independent view selection whenever the main window changes.
-    let refreshSelect: () => void = () => undefined;
-    let renderItemRows: () => void = () => undefined;
-    this.createSettingIn(group, (s) => {
-      s.setName(t("settings.importFromHost"));
-      s.setDesc(t("settings.importFromHostDesc"));
-      s.addButton((button) => {
-        button.setButtonText(t("settings.importFromHost")).onClick(async () => {
-          const imported = getViewsFromHostSplit(this.app, side);
-          if (imported.length === 0) {
-            new Notice(t("settings.importFromHostEmpty"));
-            return;
-          }
-
-          const previousActivityBars = this.plugin.settings.activityBars;
-          this.plugin.settings.activityBars = this.plugin.settings.activityBars ?? { left: [], right: [] };
-          this.plugin.settings.activityBars[side] = imported;
-          try {
-            await this.plugin.saveSettings();
-            this.plugin.activityBars.refreshAll();
-            renderItemRows();
-            new Notice(t("settings.importFromHostSuccess"));
-          } catch (error: unknown) {
-            this.plugin.settings.activityBars = previousActivityBars;
-            console.warn("Failed to import Activity Bar views from host sidebar:", error);
-          }
-        });
+    const rowSelector = `[data-window-spaces-activity-item="${side}"]`;
+    const indicatorSelector = `${rowSelector}.drag-over-top, ${rowSelector}.drag-over-bottom`;
+    const clearIndicators = () => {
+      card.querySelectorAll(indicatorSelector).forEach((el) => {
+        el.classList.remove("drag-over-top", "drag-over-bottom");
       });
-    });
-
-    this.createSettingIn(group, (s) => {
-      s.setName(t("settings.defaultActivityBarVisibility"));
-      s.setDesc(t("settings.defaultActivityBarVisibilityDesc"));
-      s.addToggle((toggle) => {
-        toggle.setValue(this.plugin.settings.activityBarDefaults?.[side] !== false);
-        toggle.onChange(async (value) => {
-          this.plugin.settings.activityBarDefaults = this.plugin.settings.activityBarDefaults ?? { left: true, right: true };
-          this.plugin.settings.activityBarDefaults[side] = value;
-          await this.plugin.saveSettings();
-          this.plugin.activityBars.refreshAll();
-        });
-      });
-    });
-
-    const items = this.plugin.settings.activityBars?.[side] ?? [];
-
-    if (items.length === 0) {
-      this.createSettingIn(group, (s) => {
-        s.setDesc(t("settings.addView"));
-      });
-    }
-
-    // 先建立 add-row（capture selectEl 供 callback 使用），最後再移到底部
-    let selectEl!: HTMLSelectElement;
-    const addRow = this.createSettingIn(group, (s) => {
-      selectEl = s.controlEl.createEl("select", {
-        cls: "dropdown",
-      });
-
-      s.addButton((button) => {
-        button.setButtonText(t("settings.addView")).onClick(() => {
-          const viewType = selectEl.value.trim();
-          if (!viewType) return;
-
-          const current = this.plugin.settings.activityBars?.[side] ?? [];
-          if (current.some((item: ActivityBarItem) => item.viewType === viewType)) return;
-
-          const newItem: ActivityBarItem = {
-            viewType,
-            side,
-            label: undefined,
-            // 見 saveModal.Add：不把 resolveViewIcon 的 fallback（"layout"）寫死——
-            // 社群 view（notebook-navigator 等）的實 icon 需動態偵測，寫死會蓋過
-            // 正確 icon；一律以動態（applyItemIcon）+ ensureViewIcon 補正。
-            icon: undefined,
-          };
-          current.push(newItem);
-          this.plugin.settings.activityBars = this.plugin.settings.activityBars ?? { left: [], right: [] };
-          this.plugin.settings.activityBars[side] = current;
-          void this.plugin.saveSettings().then(() => {
-            this.plugin.activityBars.refreshAll();
-            renderItemRows();
-
-            void ensureViewIcon(this.app, viewType).then((icon) => {
-              if (!icon) return;
-              newItem.icon = icon;
-              renderItemRows();
-              // 讓 Activity Bar 立即套用動態抓到的正確 icon（而非僅更新設定列）
-              this.plugin.activityBars.refreshAll();
-              void this.plugin.saveSettings();
-            });
-          });
-        });
-      });
-    });
-
-    refreshSelect = () => this.rebuildViewSelect(selectEl, side);
-
-    renderItemRows = () => {
-      const current = this.plugin.settings.activityBars?.[side];
-      const items = Array.isArray(current) ? current : [];
-      const validItems = items.filter(isActivityBarItem);
-
-      // Repair malformed entries left by an interrupted/old reorder instead of
-      // allowing one bad item to throw after the existing DOM is removed.
-      if (validItems.length !== items.length) {
-        this.plugin.settings.activityBars = this.plugin.settings.activityBars ?? { left: [], right: [] };
-        this.plugin.settings.activityBars[side] = validItems;
-        void this.plugin.saveSettings().catch((error: unknown) => {
-          console.warn("Failed to repair activity bar settings:", error);
-        });
-      }
-
-      const existingRows = new Map<string, HTMLElement>();
-      section.querySelectorAll<HTMLElement>(`[data-window-spaces-activity-item="${side}"]`).forEach((el) => {
-        const viewType = el.getAttribute("data-drag-view-type");
-        if (viewType) existingRows.set(viewType, el);
-      });
-
-      const activeTypes = new Set(validItems.map((item) => item.viewType));
-      existingRows.forEach((row, viewType) => {
-        if (!activeTypes.has(viewType)) row.remove();
-      });
-
-      // Reuse existing rows when reordering. This avoids a transient empty
-      // SettingGroup DOM and prevents the whole list disappearing after drop.
-      validItems.forEach((item, index) => {
-        const existingRow = existingRows.get(item.viewType);
-        if (existingRow) {
-          existingRow.setAttr("data-drag-index", String(index));
-          addRow.settingEl.before(existingRow);
-          // Add view 動態取得 icon 後（item.icon 已更新），同步到既有列的
-          // icon 按鈕，避免列上仍顯示 fallback "layout"。
-          const existingIconBtn = existingRow.querySelector<HTMLElement>(
-            ".setting-item-control button:first-of-type"
-          );
-          if (existingIconBtn) applyItemIcon(existingIconBtn, this.app, item);
-          return;
-        }
-        const handle = this.renderSideItemRow(group, side, item, index, () => {
-          renderItemRows();
-          refreshSelect();
-          this.plugin.activityBars.refreshAll();
-        });
-        addRow.settingEl.before(handle.row.settingEl);
-      });
-
-      refreshSelect();
     };
 
-    renderItemRows();
-
-    // 把 add-row 移到 items 之後（保持「view 列 → add-row」順序）
-    addRow.settingEl.parentElement?.appendChild(addRow.settingEl);
-
-    section.addEventListener("dragover", (e) => {
+    card.addEventListener("dragover", (e) => {
       e.preventDefault();
-      section.querySelectorAll(
-        `[data-window-spaces-activity-item="${side}"].drag-over-top, [data-window-spaces-activity-item="${side}"].drag-over-bottom`
-      ).forEach((el) => { el.classList.remove("drag-over-top", "drag-over-bottom"); });
+      clearIndicators();
 
-      const target = (e.target as HTMLElement).closest(`[data-window-spaces-activity-item="${side}"]`);
+      const target = (e.target as HTMLElement).closest<HTMLElement>(rowSelector);
       if (!target) return;
 
       const rect = target.getBoundingClientRect();
@@ -639,18 +573,12 @@ export class WindowSpacesSettingTab extends PluginSettingTab {
       target.classList.add(isBottom ? "drag-over-bottom" : "drag-over-top");
     });
 
-    section.addEventListener("drop", (e: DragEvent) => {
+    card.addEventListener("drop", (e: DragEvent) => {
       e.preventDefault();
 
-      const indicatorEl = section.querySelector(
-        `[data-window-spaces-activity-item="${side}"].drag-over-top, [data-window-spaces-activity-item="${side}"].drag-over-bottom`
-      );
-
+      const indicatorEl = card.querySelector<HTMLElement>(indicatorSelector);
       const isBottom = indicatorEl?.classList.contains("drag-over-bottom") ?? false;
-
-      section.querySelectorAll(
-        `[data-window-spaces-activity-item="${side}"].drag-over-top, [data-window-spaces-activity-item="${side}"].drag-over-bottom`
-      ).forEach((el) => { el.classList.remove("drag-over-top", "drag-over-bottom"); });
+      clearIndicators();
 
       if (!indicatorEl) return;
 
@@ -661,7 +589,7 @@ export class WindowSpacesSettingTab extends PluginSettingTab {
       const current = this.plugin.settings.activityBars?.[side];
       if (!Array.isArray(current)) return;
 
-      const reordered = reorderActivityBarItems(current, draggedViewType, targetViewType, isBottom);
+      const reordered = reorderActivityBarItems(current.filter(isActivityBarItem), draggedViewType, targetViewType, isBottom);
       if (!reordered) return;
 
       this.plugin.settings.activityBars = this.plugin.settings.activityBars ?? { left: [], right: [] };
@@ -669,7 +597,7 @@ export class WindowSpacesSettingTab extends PluginSettingTab {
 
       void this.plugin.saveSettings().then(() => {
         this.plugin.activityBars.refreshAll();
-        renderItemRows();
+        this.update();
       }).catch((error: unknown) => {
         console.warn("Failed to save activity bar order:", error);
       });
