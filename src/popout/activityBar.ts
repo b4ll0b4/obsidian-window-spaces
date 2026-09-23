@@ -1560,7 +1560,7 @@ export class PopoutActivityBarManager {
       });
     }
 
-    const protoCandidate = leaf ? Object.getPrototypeOf(leaf) : null;
+    const protoCandidate: unknown = leaf ? (Object.getPrototypeOf(leaf) as unknown) : null;
     const proto = isDetachableLeafPrototype(protoCandidate)
       ? protoCandidate
       : isDetachableLeafPrototype(WorkspaceLeaf.prototype)

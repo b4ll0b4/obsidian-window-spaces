@@ -72,7 +72,7 @@ type NativeDocumentTitleGetter = (this: Document) => string;
 type NativeDocumentTitleSetter = (this: Document, title: string) => void;
 
 function cloneJsonValue<T>(value: T): T {
-  return JSON.parse(JSON.stringify(value)) as unknown as T;
+  return JSON.parse(JSON.stringify(value));
 }
 
 function invokeManagerMethod<TResult>(method: unknown, receiver: unknown, args: unknown[]): TResult | undefined {
@@ -666,8 +666,8 @@ export class WindowLayoutManager {
         Object.getOwnPropertyDescriptor(targetDoc, "title");
 
       if (originalDescriptor && originalDescriptor.set) {
-        const descriptorSetter: unknown = originalDescriptor.set;
-        const descriptorGetter: unknown = originalDescriptor.get;
+        const descriptorSetter: unknown = Reflect.get(originalDescriptor, "set");
+        const descriptorGetter: unknown = Reflect.get(originalDescriptor, "get");
         const originalSet: DocumentTitleSetter | undefined =
           typeof descriptorSetter === "function"
             ? (title: string) => {
@@ -776,7 +776,7 @@ export class WindowLayoutManager {
         enumerable: true,
         get() {
           const titleDescriptor = Object.getOwnPropertyDescriptor(Document.prototype, "title");
-          const descriptorGetter: unknown = titleDescriptor?.get;
+          const descriptorGetter: unknown = titleDescriptor ? Reflect.get(titleDescriptor, "get") : undefined;
           const titleGetter: DocumentTitleGetter | undefined =
             typeof descriptorGetter === "function"
               ? () => {
