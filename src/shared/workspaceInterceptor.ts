@@ -37,7 +37,6 @@ interface InterceptableWorkspace {
   getLeftLeaf?: (split: boolean) => WorkspaceLeaf | null;
   getRightLeaf?: (split: boolean) => WorkspaceLeaf | null;
   getLeaf?: unknown;
-  getLeavesOfType?: (type: string) => WorkspaceLeaf[];
   ensureSideLeaf?: (
     viewType: string,
     side: "left" | "right",
@@ -54,7 +53,6 @@ interface InterceptableWorkspace {
   __workspaceInterceptorOriginalGetLeftLeaf?: (split: boolean) => WorkspaceLeaf | null;
   __workspaceInterceptorOriginalGetRightLeaf?: (split: boolean) => WorkspaceLeaf | null;
   __workspaceInterceptorOriginalGetLeaf?: unknown;
-  __workspaceInterceptorOriginalGetLeavesOfType?: (type: string) => WorkspaceLeaf[];
   __workspaceInterceptorOriginalEnsureSideLeaf?: (
     viewType: string,
     side: "left" | "right",
@@ -71,7 +69,6 @@ interface OriginalWorkspaceMethods {
   getLeftLeaf: { hadOwn: boolean; value?: InterceptableWorkspace["getLeftLeaf"] };
   getRightLeaf: { hadOwn: boolean; value?: InterceptableWorkspace["getRightLeaf"] };
   getLeaf: { hadOwn: boolean; value?: InterceptableWorkspace["getLeaf"] };
-  getLeavesOfType: { hadOwn: boolean; value?: InterceptableWorkspace["getLeavesOfType"] };
   ensureSideLeaf: { hadOwn: boolean; value?: InterceptableWorkspace["ensureSideLeaf"] };
   tryTrigger: { hadOwn: boolean; value?: InterceptableWorkspace["tryTrigger"] };
   getActiveFile: { hadOwn: boolean; value?: InterceptableWorkspace["getActiveFile"] };
@@ -330,10 +327,6 @@ function install(state: InterceptorState): void {
       value: workspace.getRightLeaf,
     },
     getLeaf: { hadOwn: hasOwnMethod(workspace, "getLeaf"), value: workspace.getLeaf },
-    getLeavesOfType: {
-      hadOwn: hasOwnMethod(workspace, "getLeavesOfType"),
-      value: workspace.getLeavesOfType,
-    },
     ensureSideLeaf: {
       hadOwn: hasOwnMethod(workspace, "ensureSideLeaf"),
       value: workspace.ensureSideLeaf,
@@ -347,7 +340,6 @@ function install(state: InterceptorState): void {
   workspace.__workspaceInterceptorOriginalGetLeftLeaf = workspace.getLeftLeaf;
   workspace.__workspaceInterceptorOriginalGetRightLeaf = workspace.getRightLeaf;
   workspace.__workspaceInterceptorOriginalGetLeaf = workspace.getLeaf;
-  workspace.__workspaceInterceptorOriginalGetLeavesOfType = workspace.getLeavesOfType;
   workspace.__workspaceInterceptorOriginalEnsureSideLeaf = workspace.ensureSideLeaf;
   workspace.__workspaceInterceptorOriginalTryTrigger = workspace.tryTrigger;
   workspace.__workspaceInterceptorOriginalGetActiveFile = workspace.getActiveFile;
@@ -368,19 +360,9 @@ function install(state: InterceptorState): void {
     if (restored) return restored;
     throw new Error("Workspace.getLeaf is unavailable");
   };
-  workspace.getLeavesOfType = function (type: string): WorkspaceLeaf[] {
-    const original = state.originalMethods?.getLeavesOfType.value;
-    const leaves = invokeWorkspaceMethod<WorkspaceLeaf[]>(original, workspace, [type]) ?? [];
-    const activeWindow = getActivePopoutWindow(state);
-    const participant = activeWindow ? getParticipantForWindow(state, activeWindow) : null;
-    if (!participant) return leaves;
-
-    const windowLeaves = leaves.filter((leaf) => getWindowOfLeaf(leaf) === activeWindow);
-    // Prefer local views without hiding an existing panel when this window has
-    // none. Plugins that maintain a singleton panel use this lookup during
-    // layout changes; a false empty result can trigger repeated panel creation.
-    return windowLeaves.length > 0 ? windowLeaves : leaves;
-  };
+  // Keep getLeavesOfType's global enumeration and ordering intact. Plugins use
+  // it to reconcile existing panels, not just to choose a window for commands.
+  // Window-local sidebar selection belongs in routeEnsureSideLeaf/the engine.
   workspace.ensureSideLeaf = function (
     viewType: string,
     side: "left" | "right",
@@ -470,7 +452,6 @@ function uninstall(state: InterceptorState): void {
     restoreMethod(workspace, "getLeftLeaf", original.getLeftLeaf);
     restoreMethod(workspace, "getRightLeaf", original.getRightLeaf);
     restoreMethod(workspace, "getLeaf", original.getLeaf);
-    restoreMethod(workspace, "getLeavesOfType", original.getLeavesOfType);
     restoreMethod(workspace, "ensureSideLeaf", original.ensureSideLeaf);
     restoreMethod(workspace, "tryTrigger", original.tryTrigger);
     restoreMethod(workspace, "getActiveFile", original.getActiveFile);
@@ -489,7 +470,6 @@ function uninstall(state: InterceptorState): void {
   delete workspace.__workspaceInterceptorOriginalGetLeftLeaf;
   delete workspace.__workspaceInterceptorOriginalGetRightLeaf;
   delete workspace.__workspaceInterceptorOriginalGetLeaf;
-  delete workspace.__workspaceInterceptorOriginalGetLeavesOfType;
   delete workspace.__workspaceInterceptorOriginalEnsureSideLeaf;
   delete workspace.__workspaceInterceptorOriginalTryTrigger;
   delete workspace.__workspaceInterceptorOriginalGetActiveFile;

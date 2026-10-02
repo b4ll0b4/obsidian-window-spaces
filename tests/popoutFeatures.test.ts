@@ -1084,7 +1084,7 @@ describe("WorkspaceInterceptor", () => {
     }
   });
 
-  test("getLeavesOfType filters leaves to the active window", () => {
+  test("getLeavesOfType keeps global view discovery while a popout is active", () => {
     const popoutWin = {
       document: {
         body: { classList: { contains: (cls: string) => cls === "is-popout-window" } },
@@ -1114,7 +1114,8 @@ describe("WorkspaceInterceptor", () => {
 
     try {
       const leaves = app.workspace.getLeavesOfType("grid-view");
-      expect(leaves).toEqual([leafInPopout]);
+      expect(app.workspace.getLeavesOfType).toBe(originalGetLeavesOfType);
+      expect(leaves).toEqual([leafInOtherWindow, leafInPopout]);
       expect(originalGetLeavesOfType).toHaveBeenCalledWith("grid-view");
     } finally {
       interceptor.uninstall();
