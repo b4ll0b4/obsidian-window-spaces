@@ -373,7 +373,13 @@ function install(state: InterceptorState): void {
     const leaves = invokeWorkspaceMethod<WorkspaceLeaf[]>(original, workspace, [type]) ?? [];
     const activeWindow = getActivePopoutWindow(state);
     const participant = activeWindow ? getParticipantForWindow(state, activeWindow) : null;
-    return participant ? leaves.filter((leaf) => getWindowOfLeaf(leaf) === activeWindow) : leaves;
+    if (!participant) return leaves;
+
+    const windowLeaves = leaves.filter((leaf) => getWindowOfLeaf(leaf) === activeWindow);
+    // Prefer local views without hiding an existing panel when this window has
+    // none. Plugins that maintain a singleton panel use this lookup during
+    // layout changes; a false empty result can trigger repeated panel creation.
+    return windowLeaves.length > 0 ? windowLeaves : leaves;
   };
   workspace.ensureSideLeaf = function (
     viewType: string,
