@@ -50,9 +50,11 @@ describe("workspace view discovery", () => {
       }),
     };
     const originalLookup = workspace.getLeavesOfType;
+    const originalLeft = workspace.getLeftLeaf;
+    const originalRight = workspace.getRightLeaf;
     interceptor = new WorkspaceInterceptor({ workspace } as unknown as App, engine);
     interceptor.install();
-    return { workspace, leaves, originalLookup };
+    return { workspace, leaves, originalLookup, originalLeft, originalRight };
   }
 
   test.each(["vertical-tabs", "custom-singleton-view"])(
@@ -236,4 +238,36 @@ describe("workspace view discovery", () => {
     expect(workspace.getLeavesOfType).toBe(pluginLookup);
     expect(workspace.getLeavesOfType("custom-view")).toBe(leaves);
   });
+
+  test.each([
+    ["mk-path-view", "left"], ["mk-path-view", "right"],
+    ["custom-navigator", "left"], ["custom-navigator", "right"],
+  ] as const)(
+    "a background %s rebuild in the %s sidebar keeps its destination after popout focus changes",
+    async (viewType, side) => {
+      const popout = createPopoutWindow(true);
+      const mainPanel = { ...createLeaf(window), setViewState: vi.fn().mockResolvedValue(undefined) };
+      const popoutPanel = { ...createLeaf(popout), setViewState: vi.fn().mockResolvedValue(undefined) };
+      const engine = { openSideLeafSync: vi.fn().mockReturnValue(popoutPanel) };
+      const { workspace, originalLeft, originalRight } = setup(viewType, [window], engine as unknown as PopoutLayoutEngine);
+      originalLeft.mockReturnValue(mainPanel as unknown as WorkspaceLeaf);
+      originalRight.mockReturnValue(mainPanel as unknown as WorkspaceLeaf);
+
+      // MAKE.md awaits indexing, then recreates its Navigator via the native
+      // main-sidebar API. Focus may have moved to a popout during that await.
+      const rebuild = (async () => {
+        await Promise.resolve();
+        const leaf = side === "left" ? workspace.getLeftLeaf(false) : workspace.getRightLeaf(false);
+        await leaf?.setViewState({ type: viewType });
+      })();
+      globalObject.activeWindow = popout;
+      await rebuild;
+
+      expect(mainPanel.setViewState).toHaveBeenCalledWith({ type: viewType });
+      expect(popoutPanel.setViewState).not.toHaveBeenCalled();
+      expect(engine.openSideLeafSync).not.toHaveBeenCalled();
+      expect(workspace.getLeftLeaf).toBe(originalLeft);
+      expect(workspace.getRightLeaf).toBe(originalRight);
+    }
+  );
 });
