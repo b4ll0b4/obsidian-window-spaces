@@ -34,6 +34,9 @@ interface InterceptableWorkspace {
   revealLeaf?: (leaf: WorkspaceLeaf) => Promise<void>;
   setActiveLeaf?: (leaf: WorkspaceLeaf, params?: { focus?: boolean }) => void;
   requestSaveLayout?: unknown;
+  getLeftLeaf?: (split: boolean) => WorkspaceLeaf | null;
+  getRightLeaf?: (split: boolean) => WorkspaceLeaf | null;
+  getLeavesOfType?: (type: string) => WorkspaceLeaf[];
   getLeaf?: unknown;
   ensureSideLeaf?: (
     viewType: string,
@@ -62,6 +65,11 @@ interface InterceptableWorkspace {
 }
 
 interface OriginalWorkspaceMethods {
+  // Keep the v1 coordinator's metadata shape for older participants' teardown.
+  // These native methods are captured for compatibility, never overridden.
+  getLeftLeaf: { hadOwn: boolean; value?: InterceptableWorkspace["getLeftLeaf"] };
+  getRightLeaf: { hadOwn: boolean; value?: InterceptableWorkspace["getRightLeaf"] };
+  getLeavesOfType: { hadOwn: boolean; value?: InterceptableWorkspace["getLeavesOfType"] };
   getLeaf: { hadOwn: boolean; value?: InterceptableWorkspace["getLeaf"] };
   ensureSideLeaf: { hadOwn: boolean; value?: InterceptableWorkspace["ensureSideLeaf"] };
   tryTrigger: { hadOwn: boolean; value?: InterceptableWorkspace["tryTrigger"] };
@@ -302,6 +310,9 @@ function install(state: InterceptorState): void {
   if (state.installed) return;
   const workspace = state.workspace;
   state.originalMethods = {
+    getLeftLeaf: { hadOwn: hasOwnMethod(workspace, "getLeftLeaf"), value: workspace.getLeftLeaf },
+    getRightLeaf: { hadOwn: hasOwnMethod(workspace, "getRightLeaf"), value: workspace.getRightLeaf },
+    getLeavesOfType: { hadOwn: hasOwnMethod(workspace, "getLeavesOfType"), value: workspace.getLeavesOfType },
     getLeaf: { hadOwn: hasOwnMethod(workspace, "getLeaf"), value: workspace.getLeaf },
     ensureSideLeaf: {
       hadOwn: hasOwnMethod(workspace, "ensureSideLeaf"),

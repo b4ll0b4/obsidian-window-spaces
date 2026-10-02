@@ -239,6 +239,26 @@ describe("workspace view discovery", () => {
     expect(workspace.getLeavesOfType("custom-view")).toBe(leaves);
   });
 
+  test("keeps native method descriptors available to an older shared-coordinator participant", () => {
+    const { workspace, originalLookup, originalLeft, originalRight } = setup("custom-view", [window]);
+    const namespace = window as unknown as {
+      __obsidian_workspace_interceptor_state_v1__: {
+        originalMethods: Record<string, { hadOwn: boolean; value: unknown }>;
+      };
+    };
+    const originals = namespace.__obsidian_workspace_interceptor_state_v1__.originalMethods;
+
+    // An older participant reads these descriptors when it is the final one
+    // to release the v1 coordinator. Missing entries would break its teardown.
+    for (const [key, method] of [
+      ["getLeftLeaf", originalLeft], ["getRightLeaf", originalRight], ["getLeavesOfType", originalLookup],
+    ] as const) {
+      expect(originals[key].hadOwn).toBe(true);
+      expect(originals[key].value).toBe(method);
+      expect(workspace[key]).toBe(method);
+    }
+  });
+
   test.each([
     ["mk-path-view", "left"], ["mk-path-view", "right"],
     ["custom-navigator", "left"], ["custom-navigator", "right"],
